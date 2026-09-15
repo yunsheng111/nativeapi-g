@@ -50,6 +50,8 @@ PARAM_VALUE_TAG_PATTERN = re.compile(r"<param_value>\s*(.*?)\s*</param_value>", 
 TAG_NAME_HINTS = [
     "<|",
     "</|",
+    "<DStool_calls",
+    "</DStool_calls",
     "<|DSML|",
     "</|DSML|",
     "<|DSML|tool_calls",
@@ -98,6 +100,76 @@ def _canonical_dsml_name(name: str) -> str:
     if normalized == "toolresult":
         return "tool_result"
     return normalized
+
+
+# ── 畸形标记抢救层（P2 用例 #6：模型把搅碎的 DSML 写进正文）──
+# 规则直接由 12.6 失败样本两族推导，必须保持窄匹配，只在确凿的协议畸形上
+# 触发，避免误改普通正文；命中即打日志（失败不可伪装成成功）。
+BROKEN_TOOL_CALLS_OPEN_PATTERN = re.compile(r"<\|?DS(?:ML)?tool_calls\s*\|?>", re.IGNORECASE)
+BROKEN_TOOL_CALLS_CLOSE_PATTERN = re.compile(r"</\|?DS(?:ML)?tool_calls\s*\|?>", re.IGNORECASE)
+CORRUPTED_INVOKE_LINE_PATTERN = re.compile(r"^[ \t]*<\|DSML\|invoke\b[^\n]*(?:\n|$)", re.IGNORECASE | re.MULTILINE)
+
+
+def _extract_name_values(line: str) -> list[str]:
+    # 逐个定位 name=" 再手动取到下一个引号：混串里的中间 name= 不会被
+    # 前一个匹配的值吞掉，族 B 样本（city>name="get_weather）因此可提取。
+    # 引号未闭合（族 A 的 "> 被搅没）时取到行尾，仍可凭管道痕迹判噪。
+    values: list[str] = []
+    for match in re.finditer(r'name\s*=\s*"', line, re.IGNORECASE):
+        start = match.end()
+        end = line.find('"', start)
+        if end == -1:
+            tail = line[start:].rstrip()
+            if tail.endswith(">"):
+                tail = tail[:-1]
+            values.append(tail)
+        else:
+            values.append(line[start:end])
+    return values
+
+
+def _fix_corrupted_invoke_line(line_body: str) -> str | None:
+    """返回 None 表示行无需改动；返回字符串为替换文本（空串 = 删除该行）。"""
+    values = _extract_name_values(line_body)
+    if not values:
+        return None
+    if len(values) >= 2:
+        # 族 B：属性区搅出多个 name=，最后一个才是模型要写的工具名；
+        # 尾值仍不干净时无法恢复，按噪声行删除。
+        tail = values[-1]
+        if tail and not any(ch in tail for ch in '"<>|\n'):
+            return f'<|DSML|invoke name="{tail}">'
+        return ""
+    if "|" in values[0]:
+        # 族 A：name 值混入管道痕迹的噪声 invoke（合法工具名不含 |），
+        # 删除后块内完好的 invoke 才能通过 XML 解析存活。
+        return ""
+    return None
+
+
+def _repair_corrupted_markup(text: str) -> str:
+    if "<|DSML|invoke" not in text and not BROKEN_TOOL_CALLS_OPEN_PATTERN.search(text):
+        return text
+    repaired = BROKEN_TOOL_CALLS_OPEN_PATTERN.sub("<|DSML|tool_calls>", text)
+    repaired = BROKEN_TOOL_CALLS_CLOSE_PATTERN.sub("</|DSML|tool_calls>", repaired)
+
+    changed = False
+
+    def fix_line(match: re.Match[str]) -> str:
+        nonlocal changed
+        line = match.group(0)
+        fixed = _fix_corrupted_invoke_line(line.rstrip("\n"))
+        if fixed is None:
+            return line
+        changed = True
+        if not fixed:
+            return ""  # 噪声行连换行一起删除
+        return fixed + ("\n" if line.endswith("\n") else "")
+
+    repaired = CORRUPTED_INVOKE_LINE_PATTERN.sub(fix_line, repaired)
+    if changed:
+        _logger.warning("检测到搅碎的 DSML 标记，已按失败样本族规则抢救归一化")
+    return repaired
 
 
 def _repair_malformed_dsml(block: str) -> str:
@@ -418,6 +490,7 @@ def _extract_tool_blocks(
     *,
     allow_trailing_close: bool = False,
 ) -> tuple[list[tuple[int, int]], list[dict[str, object]]]:
+    text = _repair_corrupted_markup(text)
     masked_text = _mask_code_fences(text)
     spans: list[tuple[int, int]] = []
     tool_calls: list[dict[str, object]] = []
@@ -524,6 +597,8 @@ def _looks_like_tool_markup_fragment(text: str) -> bool:
         return False
     if lowered.startswith("<|dsml|") or lowered.startswith("</|dsml|") or lowered.startswith("<|/dsml"):
         return True
+    if lowered.startswith("<dst") or lowered.startswith("</dst"):
+        return True
     if stripped.startswith("<ml_") or stripped.startswith("</ml_"):
         return True
     if stripped.startswith("<tool_") or stripped.startswith("</tool_"):
@@ -542,6 +617,7 @@ def _split_stream_text(
     allowed_tool_names: set[str] | None,
     final: bool,
 ) -> tuple[str, str, list[dict[str, object]]]:
+    text = _repair_corrupted_markup(text)
     hold_from_candidates = [
         index
         for index in (_find_unmatched_fence_start(text), _find_incomplete_block_start(text, allow_trailing_close=final))
@@ -570,6 +646,9 @@ def _split_stream_text(
 def parse_tool_calls_from_text(text: str, allowed_tool_names: set[str] | None = None) -> tuple[str, list[dict[str, object]]]:
     if not text:
         return "", []
+    # 抢救层必须在定位块之前作用：spans 以归一化后的文本为基准，
+    # _remove_spans 也必须作用在同一份文本上，否则偏移错位导致标记残留。
+    text = _repair_corrupted_markup(text)
     spans, tool_calls = _extract_tool_blocks(text, allowed_tool_names, allow_trailing_close=True)
     return _remove_spans(text, spans), tool_calls
 

@@ -6,6 +6,8 @@
     D4  删除 X-Forwarded-For 伪造头          （源码扫描 + 头集合断言）
     D1  真实 deid 接线 + 废除 8 次轮换        （断言 ①-⑤ + 热更新 + 钩子缺省回退）
     D3  并发节奏：单飞/全忙/冷却/分类/退避     （断言 S1-S9）
+    P2  工具契约修复 + 体积治理/信任壳        （断言 B1-B7 + T3 + C1-C6）
+    P2#6 DSML 写入 content 抢救              （断言 M1-M7，12.6 失败样本两族回归）
 
 用法：
     python tools/check_riskctrl.py
@@ -478,6 +480,86 @@ def check_p2(tmp: Path) -> None:
     )
 
 
+# --------------------------------------------------------------- P2 用例 #6：DSML 写入 content 的抢救
+
+# 12.6 失败样本两族（artifacts/fail_samples/fail_2-6），原样内嵌作为回归基准
+MALFORMED_FAMILY_A = (
+    '<DStool_calls>\n  <|DSML|invoke name="getML|parameter|DSML|tool_calls>\n'
+    '  <|DSML|invoke name="get_weather">\n    <|DSML|parameter name="city"><![CDATA[上海]]></|DSML|parameter>\n'
+    '  </|DSML|invoke>\n</|DSML|tool_calls>'
+)
+MALFORMED_FAMILY_B = (
+    '<DStool_calls>\n  <|DSML|invoke namer name="city>name="get_weather">\n'
+    '    <|DSML|parameter name="city"><![CDATA[上海]]></|DSML|parameter>\n'
+    '  </|DSML|invoke>\n</|DSML|tool_calls>'
+)
+
+
+def _is_rescued_weather_call(calls) -> bool:
+    return (
+        len(calls) == 1
+        and calls[0]["function"]["name"] == "get_weather"
+        and calls[0]["function"]["arguments"] == '{"city":"上海"}'
+    )
+
+
+def check_p6(tmp: Path) -> None:
+    from glm2api.utils.tool_parser import StreamingToolParser, parse_tool_calls_from_text
+
+    # M1/M2 两族样本非流式：产出工具调用 + 可见文本零标记泄漏
+    for tag, sample in (("A", MALFORMED_FAMILY_A), ("B", MALFORMED_FAMILY_B)):
+        visible, calls = parse_tool_calls_from_text(sample, {"get_weather"})
+        check(_is_rescued_weather_call(calls), f"M{1 if tag == 'A' else 2}-{tag} 畸形样本抢救出 get_weather(city=上海)")
+        check(visible == "", f"M{1 if tag == 'A' else 2}-vis{tag} 可见文本零 DSML 残留", repr(visible))
+
+    # M3 搅碎开标签变体归一化（|DStool_calls / DSMLtool_calls）
+    for head in ("<|DStool_calls>", "<DSMLtool_calls>"):
+        _, calls = parse_tool_calls_from_text(head + MALFORMED_FAMILY_A[len("<DStool_calls>"):], {"get_weather"})
+        check(len(calls) == 1, f"M3 变体头 {head} 归一化")
+
+    # M4 流式整帧：样本实测形态（SSE 单 delta 全量 content）
+    parser = StreamingToolParser(allowed_tool_names={"get_weather"})
+    visible = parser.consume(MALFORMED_FAMILY_A)
+    tail, calls = parser.flush()
+    check(_is_rescued_weather_call(calls), "M4 流式整帧产出 tool_calls")
+    check(not (("<|" in visible + tail) or ("DSt" in visible + tail)), "M4 流式整帧零泄漏", repr(visible + tail))
+
+    # M5 流式逐行帧 + 半截切点（<DSt 半个标记起头）
+    parser = StreamingToolParser(allowed_tool_names={"get_weather"})
+    for line in MALFORMED_FAMILY_A.splitlines(keepends=True):
+        parser.consume(line)
+    tail, calls = parser.flush()
+    check(_is_rescued_weather_call(calls), "M5-a 流式逐行帧产出 tool_calls")
+    parser = StreamingToolParser(allowed_tool_names={"get_weather"})
+    check(parser.consume(MALFORMED_FAMILY_A[:4]) == "", "M5-b 半截 <DSt 帧 hold 不泄漏")
+    parser.consume(MALFORMED_FAMILY_A[4:])
+    tail, calls = parser.flush()
+    check(_is_rescued_weather_call(calls), "M5-c 半截切点后续帧产出 tool_calls")
+
+    # M6 抢救命中留痕（失败不可伪装成成功）
+    logs = LogCapture()
+    parser_logger = logging.getLogger("glm2api.tool_parser")
+    parser_logger.addHandler(logs)
+    try:
+        parse_tool_calls_from_text(MALFORMED_FAMILY_A, {"get_weather"})
+    finally:
+        parser_logger.removeHandler(logs)
+    check(any("抢救归一化" in m for m in logs.messages), "M6 抢救命中输出可观测日志")
+
+    # M7 正常路径回归：完好块照常解析、正文保留、普通文本不受影响
+    good_block = (
+        '<|DSML|tool_calls>\n  <|DSML|invoke name="get_weather">\n'
+        '    <|DSML|parameter name="city"><![CDATA[上海]]></|DSML|parameter>\n'
+        '  </|DSML|invoke>\n</|DSML|tool_calls>'
+    )
+    visible, calls = parse_tool_calls_from_text("前文说明 " + good_block + " 后记", {"get_weather"})
+    check(len(calls) == 1, "M7-a 完好块照常解析")
+    check("前文说明" in visible and "后记" in visible, "M7-b 完好块前后正文保留", repr(visible))
+    plain = '介绍 <DS 结构与 name="a|b" 的写法，纯属正文。'
+    visible, calls = parse_tool_calls_from_text(plain, None)
+    check(calls == [] and visible == plain, "M7-c 普通正文不被误判", repr(visible))
+
+
 def main() -> int:
     os.environ.pop("GLM_TOKEN_FILE", None)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
@@ -499,6 +581,7 @@ def main() -> int:
         check_d3(tmp)
         check_runtime(tmp)
         check_p2(tmp)
+        check_p6(tmp)
     finally:
         os.chdir(prev_cwd)
         shutil.rmtree(tmp, ignore_errors=True)
