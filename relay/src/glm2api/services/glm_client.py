@@ -7,6 +7,7 @@ import http.client
 import json
 import socket
 import mimetypes
+import random
 import re
 import threading
 import time
@@ -128,6 +129,9 @@ class GLMWebClient:
         self.config = config
         self.logger = logger
         self.auth = GLMAccessTokenManager(config=config, logger=logger)
+        # 单身份单飞（D3）：同一账号同时只跑一条上游流。锁与账号槽一一对应，
+        # 每个请求至多持有一把，无锁序死锁面。
+        self._account_locks = [threading.Lock() for _ in range(max(1, len(config.glm_refresh_tokens)))]
         self.request_queue = ConcurrentRequestQueue(
             logger=logger,
             wait_timeout=config.glm_queue_wait_timeout,
@@ -963,6 +967,14 @@ class GLMWebClient:
             return None
         return ticket % account_count
 
+    def _apply_request_pacing(self, account_index: int) -> None:
+        """请求发起前的节奏控制（D3）：随机抖动 + 游客槽错峰。只影响发起时刻，
+        不影响流内 keepalive（_iter_sse_events 的空闲计时从首个响应字节才开始）。"""
+        jitter_ms = self.config.glm_request_jitter_ms
+        if jitter_ms > 0:
+            time.sleep(random.uniform(0, jitter_ms) / 1000.0)
+        self.auth.apply_guest_stagger(account_index)
+
     def _call_with_account_failover(
         self,
         request_name: str,
@@ -974,33 +986,65 @@ class GLMWebClient:
             raise RuntimeError("没有可用的 GLM 账号或游客 token 配置")
         start_index = preferred_account_index % account_count if preferred_account_index is not None else self.auth.get_current_account_index()
         last_exc: Exception | None = None
+        idle_rounds = 0
 
-        for offset in range(account_count):
-            account_index = (start_index + offset) % account_count
-            guest_retry_limit = self.config.glm_guest_max_retries if self.auth.is_guest_account(account_index) else 0
-            for attempt in range(guest_retry_limit + 1):
+        while True:
+            executed = False
+            for offset in range(account_count):
+                account_index = (start_index + offset) % account_count
+                if self.auth.is_account_cooling_down(account_index):
+                    continue  # 冷却中的账号不硬打上游（风控事件后快速重试等于火上浇油）
+                guest_retry_limit = self.config.glm_guest_max_retries if self.auth.is_guest_account(account_index) else 0
+                lock = self._account_locks[account_index % len(self._account_locks)]
+                if not lock.acquire(blocking=False):
+                    continue  # 单身份单飞：该账号有在飞请求，按 failover 顺序试下一个
                 try:
-                    access_token = self.auth.get_access_token_for_account(account_index)
-                    return operation(account_index, access_token)
-                except Exception as exc:
-                    last_exc = exc
-                    should_switch = self.auth.should_switch_account(exc)
-                    if should_switch:
-                        self.auth.invalidate_account(account_index)
-                    if should_switch and attempt < guest_retry_limit:
-                        self.logger.warning(
-                            "游客账号请求失败，重新获取游客 ck 重试 attempt=%s/%s request=%s account=%s error=%s",
-                            attempt + 1,
-                            guest_retry_limit,
-                            request_name,
-                            account_index,
-                            exc,
-                        )
-                        continue
-                    if not should_switch or account_count == 1:
-                        raise
-                    self.auth.advance_account(account_index, f"{request_name}: {exc}")
-                    break
+                    for attempt in range(guest_retry_limit + 1):
+                        try:
+                            self._apply_request_pacing(account_index)
+                            access_token = self.auth.get_access_token_for_account(account_index)
+                            executed = True
+                            return operation(account_index, access_token)
+                        except Exception as exc:
+                            last_exc = exc
+                            is_risk = self.auth.classify_risk_event(exc)
+                            if is_risk:
+                                self.auth.register_risk_event(account_index, exc)
+                            should_switch = self.auth.should_switch_account(exc)
+                            if should_switch:
+                                self.auth.invalidate_account(account_index)
+                            if should_switch and attempt < guest_retry_limit:
+                                backoff = self.auth.next_risk_backoff(attempt) if is_risk else 0.0
+                                self.logger.warning(
+                                    "游客账号请求失败，重新获取游客 ck 重试 attempt=%s/%s backoff=%.1fs request=%s account=%s error=%s",
+                                    attempt + 1,
+                                    guest_retry_limit,
+                                    backoff,
+                                    request_name,
+                                    account_index,
+                                    exc,
+                                )
+                                if backoff > 0:
+                                    time.sleep(backoff)
+                                continue
+                            if not should_switch or account_count == 1:
+                                raise
+                            self.auth.advance_account(account_index, f"{request_name}: {exc}")
+                            break
+                finally:
+                    lock.release()
+            if not executed:
+                # 所有账号或在飞（单飞占满）或冷却中：整体等待后重试，
+                # 上限复用 busy 重试参数 —— 与"上游忙碌"同一档的耐心。
+                idle_rounds += 1
+                if idle_rounds > self.config.glm_busy_max_retries:
+                    raise UpstreamAPIError(
+                        status_code=429,
+                        message="GLM 账号全部忙碌或风控冷却中，请稍后重试。",
+                    )
+                time.sleep(self.config.glm_busy_retry_interval)
+                continue
+            break
 
         self.auth.reset_account_cycle()
         if last_exc is not None:

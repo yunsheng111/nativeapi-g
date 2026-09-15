@@ -19,6 +19,14 @@ from ..logging_utils import debug_dump
 
 SIGN_SECRET = "8a1317a7468aa3ad86e997d08f3f31cb"
 ACCESS_TOKEN_EXPIRES_SECONDS = 3600
+# 风控冷却（D3）：同类风控事件累计达到阈值即冷却，冷却期间该账号不接新请求。
+# 冷却触发时把 device_id 换成新匿名值（D1 安全阀），不覆盖 accounts.json 的真实
+# deid —— 服务重启后自动回归真实身份。
+RISK_EVENT_THRESHOLD = 3
+RISK_COOLDOWN_SECONDS = 600
+# 视为风控信号的 HTTP 状态：401 签名/授权拒绝、403 封禁、405 游客通道被拒（社区实测）。
+# 429 单独判断：上游"其他对话生成中"的忙碌形态不算风控。
+RISK_STATUS_CODES = frozenset({401, 403, 405})
 
 
 def build_sign() -> tuple[str, str, str]:
@@ -46,6 +54,9 @@ class AccountState:
     device_id: str = ""
     request_id_counter: int = 0
     device_request_count: int = 0
+    risk_event_count: int = 0
+    cooldown_until: float = 0.0
+    stagger_done: bool = False
 
 
 class GLMAccessTokenManager:
@@ -353,3 +364,69 @@ class GLMAccessTokenManager:
         if isinstance(exc, RuntimeError):
             return "token" in str(exc).lower()
         return False
+
+    def classify_risk_event(self, exc: Exception) -> bool:
+        """判断异常是否为风控信号（D3）。
+
+        429 需要区分：payload 带 status=10061 或"请等待其他对话生成完毕"是
+        上游忙碌（已有独立的重试语义），不算风控；其余 429（限流爆发）计入。
+        """
+        status = getattr(exc, "status_code", None)
+        if status is not None:
+            if status == 429:
+                payload = getattr(exc, "payload", None) or {}
+                message = str(payload.get("message", ""))
+                if payload.get("status") == 10061 or "请等待其他对话生成完毕" in message:
+                    return False
+                return True
+            return status in RISK_STATUS_CODES
+        if isinstance(exc, urllib.error.HTTPError):
+            return exc.code in RISK_STATUS_CODES or exc.code == 429
+        return False
+
+    def register_risk_event(self, account_index: int, exc: Exception) -> bool:
+        """记录一次风控事件；累计达阈值进入冷却并轮换设备身份。返回是否触发冷却。"""
+        with self._lock:
+            if not (0 <= account_index < len(self._accounts)):
+                return False
+            acc = self._accounts[account_index]
+            acc.risk_event_count += 1
+            if acc.risk_event_count < RISK_EVENT_THRESHOLD:
+                return False
+            acc.risk_event_count = 0
+            acc.cooldown_until = time.time() + RISK_COOLDOWN_SECONDS
+            old_dev = acc.device_id[:8]
+            acc.device_id = uuid.uuid4().hex
+            acc.cached_token = None
+            self.logger.warning(
+                "account=%s 风控事件累计达阈值，进入冷却 %ss 并轮换 device_id %s → %s（accounts.json 中的真实身份不受影响，重启后回归）",
+                account_index, RISK_COOLDOWN_SECONDS, old_dev, acc.device_id[:8],
+            )
+            return True
+
+    def is_account_cooling_down(self, account_index: int) -> bool:
+        with self._lock:
+            if 0 <= account_index < len(self._accounts):
+                return time.time() < self._accounts[account_index].cooldown_until
+            return False
+
+    def next_risk_backoff(self, attempt: int) -> float:
+        """风控类异常的同账号重试退避：min(60, 2^n) 秒 + 半程抖动。"""
+        base = min(60.0, 2.0 ** max(0, attempt))
+        return base + random.uniform(0, base * 0.5)
+
+    def apply_guest_stagger(self, account_index: int) -> None:
+        """游客槽错峰（D3）：每个游客槽首次请求前随机延迟一次，替代瞬时全新设备群。"""
+        with self._lock:
+            if not (0 <= account_index < len(self._accounts)):
+                return
+            acc = self._accounts[account_index]
+            if not acc.is_guest or acc.stagger_done:
+                return
+            acc.stagger_done = True
+        seconds = self.config.glm_guest_stagger_seconds
+        if seconds <= 0:
+            return
+        delay = random.uniform(0, seconds)
+        self.logger.info("游客槽错峰上岗 account=%s 首次请求前延迟 %.1fs", account_index, delay)
+        time.sleep(delay)
