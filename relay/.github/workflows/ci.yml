@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          pip install -e .
+          pip install pytest
+
+      - name: Run tests
+        run: |
+          python -m pytest tests/ -v
+
+      - name: Verify imports
+        run: |
+          python -c "from glm2api.app import create_application; print('imports OK')"
+          python -c "from glm2api.admin import handle_admin_page; print('admin imports OK')"
+          python -c "from glm2api.core.openai_compat import gen_chatcmpl_id; print('core.openai_compat OK')"
+          python -c "from glm2api.core.tokenizer import count_tokens; print('core.tokenizer OK')"
+          python -c "from glm2api.model_variants import expand_model_variants; print('model_variants OK')"

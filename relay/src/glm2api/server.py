@@ -1,0 +1,701 @@
+from __future__ import annotations
+
+import json
+import queue
+import socket
+import threading
+import time
+import traceback
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from logging import Logger
+from urllib.parse import urlparse
+
+from .config import AppConfig
+from .logging_utils import debug_dump
+from .admin import (
+    ApiKeyStore,
+    RequestLogStore,
+    RequestRecord,
+    handle_admin_api_key_create,
+    handle_admin_api_key_delete,
+    handle_admin_api_key_toggle,
+    handle_admin_api_key_update,
+    handle_admin_api_keys_list,
+    handle_admin_chat_test,
+    handle_admin_config,
+    handle_admin_login,
+    handle_admin_logout,
+    handle_admin_logs,
+    handle_admin_overview,
+    handle_admin_page,
+    handle_admin_requests,
+    handle_admin_requests_clear,
+    handle_admin_session,
+)
+from .services.anthropic_adapter import (
+    AnthropicStreamAccumulator,
+    anthropic_to_openai,
+    openai_to_anthropic_response,
+)
+from .services.glm_client import GLMWebClient, QueueTimeoutError, UpstreamAPIError
+from .services.responses_adapter import (
+    ResponsesStreamAccumulator,
+    openai_to_responses,
+    responses_to_openai,
+)
+
+# ── glmrelay 扩展层 ─────────────────────────────────────────────────────────
+# 这是底座里唯一为扩展层预留的依赖。新增管理端点、账号导入等能力全部走
+# glmrelay.admin_ext.handle_admin_ext，避免在 server.py 里堆积改动。
+try:
+    from glmrelay.admin_ext import handle_admin_ext as _handle_admin_ext
+except ImportError:  # glmrelay 未安装时底座仍可独立运行
+    def _handle_admin_ext(handler, method: str, path: str, config) -> bool:
+        return False
+
+
+_CLIENT_DISCONNECTED = (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, socket.timeout)
+RESPONSES_STREAM_HEARTBEAT_SECONDS = 5.0
+
+# MIME types for static files
+_STATIC_MIME: dict[str, str] = {
+    ".js": "application/javascript; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+}
+
+
+def _serve_admin_static(handler, path: str) -> None:
+    """Serve static files from the admin_static/lib directory."""
+    from pathlib import Path
+
+    filename = path.removeprefix("/admin/lib/")
+    lib_dir = Path(__file__).parent / "admin_static" / "lib"
+    file_path = lib_dir / filename
+
+    # Security: prevent directory traversal
+    try:
+        file_path = file_path.resolve(strict=False)
+    except (ValueError, OSError):
+        handler.send_response(404)
+        handler.end_headers()
+        return
+    if not str(file_path).startswith(str(lib_dir.resolve())):
+        handler.send_response(403)
+        handler.end_headers()
+        return
+
+    if not file_path.is_file():
+        handler.send_response(404)
+        handler.end_headers()
+        return
+
+    suffix = file_path.suffix.lower()
+    content_type = _STATIC_MIME.get(suffix, "application/octet-stream")
+    body = file_path.read_bytes()
+
+    handler.send_response(200)
+    handler.send_header("Content-Type", content_type)
+    handler.send_header("Content-Length", str(len(body)))
+    handler.send_header("Cache-Control", "no-store")
+    handler.end_headers()
+    handler.wfile.write(body)
+
+
+class GLM2APIServer:
+    def __init__(self, config: AppConfig, glm_client: GLMWebClient, logger: Logger) -> None:
+        self.config = config
+        self.glm_client = glm_client
+        self.logger = logger
+        self.api_key_store = ApiKeyStore()
+        # Load existing keys from env
+        import os
+        raw = os.environ.get("GLM2API_API_KEYS", "")
+        if raw:
+            self.api_key_store.load_json(raw)
+        handler_cls = self._build_handler()
+        self._server = ThreadingHTTPServer((config.host, config.port), handler_cls)
+        self._server.daemon_threads = True
+        self._server.allow_reuse_address = True
+
+    def serve_forever(self) -> None:
+        self._server.serve_forever()
+
+    def shutdown(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+
+    def _build_handler(self):
+        config = self.config
+        glm_client = self.glm_client
+        logger = self.logger
+        api_key_store = self.api_key_store
+        request_store = RequestLogStore()
+
+        class RequestHandler(BaseHTTPRequestHandler):
+            server_version = "glm2api/0.1.0"
+            protocol_version = "HTTP/1.1"
+
+            # Admin integration attributes
+            _admin_config = config
+            _admin_glm_client = glm_client
+            _admin_request_store = request_store
+            _admin_api_key_store = api_key_store
+
+            def do_OPTIONS(self) -> None:
+                self.send_response(HTTPStatus.NO_CONTENT)
+                self._send_common_headers()
+                self.end_headers()
+
+            def do_GET(self) -> None:
+                _start = time.time()
+                try:
+                    self._debug_log_request_start()
+                    path = self._path_without_query()
+                    if path == "/health":
+                        self._write_json(HTTPStatus.OK, {"status": "ok"})
+                        request_store.add(RequestRecord(method="GET", path="/health", status=200, duration_ms=(time.time() - _start) * 1000))
+                        return
+
+                    if path == f"{config.api_prefix}/models":
+                        self._write_json(
+                            HTTPStatus.OK,
+                            {
+                                "object": "list",
+                                "data": [
+                                    {"id": model, "object": "model", "owned_by": "glm2api"}
+                                    for model in config.exposed_models
+                                ],
+                            },
+                        )
+                        request_store.add(RequestRecord(method="GET", path="/v1/models", status=200, duration_ms=(time.time() - _start) * 1000))
+                        return
+
+                    # ── Admin static files (lib) ──────────────────────────
+                    if path.startswith("/admin/lib/"):
+                        _serve_admin_static(self, path)
+                        return
+
+                    # ── glmrelay 扩展：账号池 / 登录导入 ────────────────
+                    if _handle_admin_ext(self, "GET", path, config):
+                        return
+
+                    # ── Admin routes ────────────────────────────────────
+                    if path in ("/admin", "/admin/"):
+                        handle_admin_page(self)
+                        return
+
+                    if path == "/admin/api/session":
+                        handle_admin_session(self)
+                        return
+
+                    if path == "/admin/api/overview":
+                        handle_admin_overview(self)
+                        return
+
+                    if path == "/admin/api/config":
+                        handle_admin_config(self)
+                        return
+
+                    if path.startswith("/admin/api/logs"):
+                        handle_admin_logs(self)
+                        return
+
+                    if path.startswith("/admin/api/requests"):
+                        handle_admin_requests(self)
+                        return
+
+                    if path == "/admin/api/api-keys":
+                        handle_admin_api_keys_list(self)
+                        return
+
+                    logger.debug("GET 未匹配 path=%s", self.path)
+                    self._write_json(HTTPStatus.NOT_FOUND, {"error": {"message": "Not Found"}})
+                    request_store.add(RequestRecord(method="GET", path=path, status=404, duration_ms=(time.time() - _start) * 1000))
+                except _CLIENT_DISCONNECTED:
+                    logger.warning("客户端在 GET 响应写回前断开 path=%s", self.path)
+                except Exception as exc:
+                    logger.error("处理 GET 请求失败 path=%s error=%s\n%s", self.path, exc, traceback.format_exc())
+                    self._safe_write_json(
+                        HTTPStatus.INTERNAL_SERVER_ERROR,
+                        {"error": {"message": "服务内部错误", "type": exc.__class__.__name__}},
+                    )
+
+            def do_POST(self) -> None:
+                _start = time.time()
+                path = self._path_without_query()
+                try:
+                    self._debug_log_request_start()
+                    # ── glmrelay 扩展：账号池 / 登录导入 ────────────────
+                    if _handle_admin_ext(self, "POST", path, config):
+                        return
+
+                    # ── Admin POST routes ──────────────────────────────
+                    if path == "/admin/api/login":
+                        handle_admin_login(self, config)
+                        return
+
+                    if path == "/admin/api/logout":
+                        handle_admin_logout(self)
+                        return
+
+                    if path == "/admin/api/chat-test":
+                        handle_admin_chat_test(self)
+                        return
+
+                    if path == "/admin/api/requests/clear":
+                        handle_admin_requests_clear(self)
+                        return
+
+                    # ── API Key management ──────────────────────────
+                    # POST /admin/api/api-keys/{name}         — update
+                    # POST /admin/api/api-keys/{name}/delete  — delete
+                    # POST /admin/api/api-keys/{name}/toggle  — toggle
+                    if path.startswith("/admin/api/api-keys/"):
+                        rest = path[len("/admin/api/api-keys/"):]
+                        if rest.endswith("/delete"):
+                            handle_admin_api_key_delete(self, rest[:-len("/delete")])
+                            return
+                        if rest.endswith("/toggle"):
+                            handle_admin_api_key_toggle(self, rest[:-len("/toggle")])
+                            return
+                        if rest:
+                            handle_admin_api_key_update(self, rest)
+                            return
+                        return
+
+                    if path == "/admin/api/api-keys":
+                        handle_admin_api_key_create(self)
+                        return
+                    if path not in {
+                        f"{config.api_prefix}/chat/completions",
+                        f"{config.api_prefix}/images/generations",
+                        f"{config.api_prefix}/messages",
+                        f"{config.api_prefix}/responses",
+                    }:
+                        logger.debug("POST 未匹配 path=%s", self.path)
+                        self._write_json(HTTPStatus.NOT_FOUND, {"error": {"message": "Not Found"}})
+                        return
+
+                    if not self._authorize():
+                        logger.warning("认证失败 path=%s ip=%s", self.path, self.client_address[0])
+                        self._write_json(HTTPStatus.UNAUTHORIZED, {"error": {"message": "Unauthorized"}})
+                        return
+
+                    content_length = self._parse_content_length()
+                    if content_length < 0:
+                        self._write_json(
+                            HTTPStatus.BAD_REQUEST,
+                            {"error": {"message": "Content-Length 不能为负数。", "type": "invalid_content_length"}},
+                        )
+                        return
+                    raw_body = self.rfile.read(content_length) if content_length else b"{}"
+                    debug_dump(logger, config.debug_dump_all, f"HTTP 入站原始请求体 path={self.path}", raw_body)
+                    try:
+                        payload = json.loads(raw_body.decode("utf-8"))
+                    except UnicodeDecodeError:
+                        self._write_json(
+                            HTTPStatus.BAD_REQUEST,
+                            {"error": {"message": "请求体必须是 UTF-8 编码。", "type": "invalid_encoding"}},
+                        )
+                        return
+                    except json.JSONDecodeError as exc:
+                        self._write_json(
+                            HTTPStatus.BAD_REQUEST,
+                            {
+                                "error": {
+                                    "message": f"请求体不是合法 JSON: {exc.msg}",
+                                    "type": "invalid_json",
+                                }
+                            },
+                        )
+                        return
+
+                    if not isinstance(payload, dict):
+                        self._write_json(
+                            HTTPStatus.BAD_REQUEST,
+                            {"error": {"message": "请求体顶层必须是 JSON 对象。", "type": "invalid_payload"}},
+                        )
+                        return
+                    debug_dump(logger, config.debug_dump_all, f"HTTP 入站解析后 JSON path={self.path}", payload)
+
+                    # --- Anthropic Messages API ---
+                    if path == f"{config.api_prefix}/messages":
+                        logger.info("收到 Anthropic 请求 model=%s stream=%s", payload.get("model"), payload.get("stream"))
+                        self._handle_anthropic_messages(payload)
+                        return
+
+                    # --- OpenAI Responses API ---
+                    if path == f"{config.api_prefix}/responses":
+                        logger.info("收到 Responses 请求 model=%s stream=%s", payload.get("model"), payload.get("stream"))
+                        self._handle_responses(payload)
+                        return
+
+                    # --- Image generation ---
+                    if path == f"{config.api_prefix}/images/generations":
+                        if not payload.get("prompt"):
+                            self._write_json(
+                                HTTPStatus.BAD_REQUEST,
+                                {"error": {"message": "图片生成请求必须包含 prompt 字段。"}},
+                            )
+                            return
+                        logger.info("收到绘图请求 model=%s prompt=%s", payload.get("model"), payload.get("prompt"))
+                        result = glm_client.generate_images(payload)
+                        self._write_json(HTTPStatus.OK, result)
+                        request_store.add(RequestRecord(
+                            method="POST", path=path, model=str(payload.get("model", "")),
+                            status=200, duration_ms=(time.time() - _start) * 1000,
+                        ))
+                        return
+
+                    # --- Chat completions ---
+                    if not isinstance(payload.get("messages"), list) or not payload.get("model"):
+                        self._write_json(
+                            HTTPStatus.BAD_REQUEST,
+                            {"error": {"message": "请求体必须包含 model 和 messages 字段。"}},
+                        )
+                        return
+
+                    if payload.get("stream"):
+                        self._stream_completion(payload)
+                        return
+
+                    logger.info("收到 chat 请求 model=%s", payload.get("model"))
+                    result, conversation_id = glm_client.chat_completion(payload)
+                    self._write_json(HTTPStatus.OK, result)
+                    request_store.add(RequestRecord(
+                        method="POST", path=path, model=str(payload.get("model", "")),
+                        status=200, duration_ms=(time.time() - _start) * 1000,
+                    ))
+                except QueueTimeoutError as exc:
+                    logger.warning("GLM 队列等待超时 error=%s", exc)
+                    self._write_json(
+                        HTTPStatus.SERVICE_UNAVAILABLE,
+                        {"error": {"message": str(exc), "type": "queue_timeout"}},
+                    )
+                except UpstreamAPIError as exc:
+                    logger.warning("上游 GLM 返回错误 status=%s error=%s", exc.status_code, exc)
+                    status = self._safe_http_status(exc.status_code, fallback=HTTPStatus.BAD_GATEWAY)
+                    self._write_json(
+                        status,
+                        {"error": {"message": str(exc), "type": "upstream_error", "details": exc.payload}},
+                    )
+                except ValueError as exc:
+                    logger.warning("请求参数错误 path=%s error=%s", self.path, exc)
+                    self._write_json(
+                        HTTPStatus.BAD_REQUEST,
+                        {"error": {"message": str(exc), "type": "invalid_request"}},
+                    )
+                except _CLIENT_DISCONNECTED as exc:
+                    logger.warning("客户端连接提前断开 path=%s error=%s", self.path, exc)
+                except Exception as exc:
+                    logger.error("处理请求失败 error=%s\n%s", exc, traceback.format_exc())
+                    self._safe_write_json(
+                        HTTPStatus.BAD_GATEWAY,
+                        {"error": {"message": str(exc), "type": exc.__class__.__name__}},
+                    )
+
+            # ---- Anthropic Messages API ----
+
+            def _handle_anthropic_messages(self, payload: dict[str, object]) -> None:
+                model = str(payload.get("model", "glm-4"))
+                openai_payload = anthropic_to_openai(payload)
+
+                if payload.get("stream"):
+                    self._stream_anthropic(openai_payload, model)
+                    return
+
+                result, _ = glm_client.chat_completion(openai_payload)
+                response = openai_to_anthropic_response(result, model)
+                self._write_json(HTTPStatus.OK, response)
+
+            def _stream_anthropic(self, openai_payload: dict[str, object], model: str) -> None:
+                openai_payload["stream"] = True
+                stream_iter = glm_client.stream_chat_completion(openai_payload)
+                accumulator = AnthropicStreamAccumulator(model=model)
+
+                self.send_response(HTTPStatus.OK)
+                self._send_common_headers()
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "close")
+                self.end_headers()
+
+                try:
+                    for chunk in stream_iter:
+                        if not chunk:
+                            continue
+                        if not accumulator.started:
+                            start_event = accumulator.start_message()
+                            self.wfile.write(start_event.encode("utf-8"))
+                            self.wfile.flush()
+                        events = accumulator.feed_chunk(chunk)
+                        for event in events:
+                            self.wfile.write(event.encode("utf-8"))
+                            self.wfile.flush()
+                except _CLIENT_DISCONNECTED as exc:
+                    logger.warning("客户端在 Anthropic 流式响应过程中断开 model=%s error=%s", model, exc)
+                    return
+                except Exception as exc:
+                    logger.error("Anthropic 流式请求失败 model=%s error=%s\n%s", model, exc, traceback.format_exc())
+
+                # Ensure message_stop is always sent (idempotent via _finished flag)
+                if accumulator.started:
+                    try:
+                        for event in accumulator._finish():
+                            self.wfile.write(event.encode("utf-8"))
+                            self.wfile.flush()
+                    except _CLIENT_DISCONNECTED:
+                        pass
+
+                logger.info("Anthropic 流式请求完成 model=%s", model)
+
+            # ---- OpenAI Responses API ----
+
+            def _handle_responses(self, payload: dict[str, object]) -> None:
+                model = str(payload.get("model", "glm-4"))
+                openai_payload = responses_to_openai(payload)
+
+                if payload.get("stream"):
+                    self._stream_responses(openai_payload, model)
+                    return
+
+                result, _ = glm_client.chat_completion(openai_payload)
+                response = openai_to_responses(result, model)
+                self._write_json(HTTPStatus.OK, response)
+
+            def _stream_responses(self, openai_payload: dict[str, object], model: str) -> None:
+                openai_payload["stream"] = True
+                stream_iter = glm_client.stream_chat_completion(openai_payload)
+                accumulator = ResponsesStreamAccumulator(model=model)
+
+                self.send_response(HTTPStatus.OK)
+                self._send_common_headers()
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "close")
+                self.end_headers()
+
+                chunk_queue: queue.Queue[object] = queue.Queue()
+                sentinel = object()
+
+                def read_upstream() -> None:
+                    try:
+                        for upstream_chunk in stream_iter:
+                            chunk_queue.put(upstream_chunk)
+                    except BaseException as exc:
+                        chunk_queue.put(exc)
+                    finally:
+                        chunk_queue.put(sentinel)
+
+                threading.Thread(target=read_upstream, daemon=True).start()
+
+                try:
+                    while True:
+                        try:
+                            queued = chunk_queue.get(timeout=RESPONSES_STREAM_HEARTBEAT_SECONDS)
+                        except queue.Empty:
+                            self.wfile.write(b": keep-alive\n\n")
+                            self.wfile.flush()
+                            continue
+
+                        if queued is sentinel:
+                            break
+                        if isinstance(queued, BaseException):
+                            raise queued
+                        chunk = queued
+                        if not chunk:
+                            continue
+                        if not accumulator.started:
+                            start_events = accumulator.start_response()
+                            for event in start_events:
+                                self.wfile.write(event.encode("utf-8"))
+                            self.wfile.flush()
+                        events = accumulator.feed_chunk(chunk)  # type: ignore[arg-type]
+                        for event in events:
+                            self.wfile.write(event.encode("utf-8"))
+                            self.wfile.flush()
+                except _CLIENT_DISCONNECTED as exc:
+                    logger.warning("客户端在 Responses 流式响应过程中断开 model=%s error=%s", model, exc)
+                    return
+                except Exception as exc:
+                    logger.error("Responses 流式请求失败 model=%s error=%s\n%s", model, exc, traceback.format_exc())
+
+                # Ensure response.completed is always sent (idempotent via _finished flag)
+                if accumulator.started:
+                    try:
+                        for event in accumulator._finish():
+                            self.wfile.write(event.encode("utf-8"))
+                            self.wfile.flush()
+                    except _CLIENT_DISCONNECTED:
+                        pass
+
+                logger.info("Responses 流式请求完成 model=%s", model)
+
+            # ---- Chat completions (original) ----
+
+            STREAM_HEARTBEAT_SECONDS = 25.0
+
+            def _stream_completion(self, payload: dict[str, object]) -> None:
+                model = str(payload.get("model", "unknown"))
+                logger.info("开始流式响应 model=%s", model)
+                stream_iter = glm_client.stream_chat_completion(payload)
+                self.send_response(HTTPStatus.OK)
+                self._send_common_headers()
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "close")
+                self.end_headers()
+
+                chunk_queue: queue.Queue[object] = queue.Queue()
+                sentinel = object()
+
+                def read_upstream() -> None:
+                    try:
+                        for upstream_chunk in stream_iter:
+                            if upstream_chunk:
+                                chunk_queue.put(upstream_chunk)
+                    except BaseException as exc:
+                        chunk_queue.put(exc)
+                    finally:
+                        chunk_queue.put(sentinel)
+
+                threading.Thread(target=read_upstream, daemon=True).start()
+
+                sent_done = False
+                try:
+                    while True:
+                        try:
+                            queued = chunk_queue.get(timeout=self.__class__.STREAM_HEARTBEAT_SECONDS)
+                        except queue.Empty:
+                            self.wfile.write(b": keepalive\n\n")
+                            self.wfile.flush()
+                            continue
+
+                        if queued is sentinel:
+                            break
+                        if isinstance(queued, BaseException):
+                            raise queued
+
+                        chunk = queued
+                        debug_dump(logger, config.debug_dump_all, f"HTTP 出站流式分片 model={model}", chunk)
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+                        if b"data: [DONE]\n\n" in chunk:
+                            sent_done = True
+                except UpstreamAPIError as exc:
+                    logger.warning("流式请求中途收到上游错误 status=%s error=%s", exc.status_code, exc)
+                    self._write_sse_error(str(exc), "upstream_error")
+                except _CLIENT_DISCONNECTED as exc:
+                    logger.warning("客户端在流式响应过程中断开 model=%s error=%s", model, exc)
+                    return
+                except Exception as exc:
+                    logger.error("流式请求失败 model=%s error=%s\n%s", model, exc, traceback.format_exc())
+                    self._write_sse_error(str(exc), exc.__class__.__name__)
+                finally:
+                    if not sent_done:
+                        try:
+                            self.wfile.write(b"data: [DONE]\n\n")
+                            self.wfile.flush()
+                        except _CLIENT_DISCONNECTED:
+                            pass
+                logger.info("流式请求完成 model=%s", model)
+
+            # ---- Auth ----
+
+            def _authorize(self) -> bool:
+                # Check legacy SERVER_API_KEYS first
+                if config.server_api_keys:
+                    authorization = self.headers.get("Authorization", "")
+                    if authorization.startswith("Bearer "):
+                        token = authorization[7:].strip()
+                        if token in config.server_api_keys:
+                            return True
+                    x_api_key = self.headers.get("x-api-key", "")
+                    if x_api_key and x_api_key.strip() in config.server_api_keys:
+                        return True
+
+                # Check structured API key store
+                store: ApiKeyStore = self._admin_api_key_store
+                if store.active_count > 0:
+                    authorization = self.headers.get("Authorization", "")
+                    if authorization.startswith("Bearer "):
+                        if store.validate(authorization[7:].strip()):
+                            return True
+                    x_api_key = self.headers.get("x-api-key", "")
+                    if x_api_key and store.validate(x_api_key.strip()):
+                        return True
+
+                # If neither legacy keys nor store keys exist, auth is open
+                if not config.server_api_keys and store.active_count == 0:
+                    return True
+                return False
+
+            # ---- Helpers ----
+
+            def _write_json(self, status: HTTPStatus, payload: dict[str, object]) -> None:
+                body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+                debug_dump(logger, config.debug_dump_all, f"HTTP 出站 JSON 响应 status={int(status)} path={self.path}", body)
+                self.send_response(status)
+                self._send_common_headers()
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def _send_common_headers(self) -> None:
+                self.send_header("Access-Control-Allow-Origin", config.cors_allow_origin)
+                self.send_header(
+                    "Access-Control-Allow-Headers",
+                    "Authorization, Content-Type, x-api-key, anthropic-version",
+                )
+                self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+
+            def _safe_write_json(self, status: HTTPStatus, payload: dict[str, object]) -> None:
+                try:
+                    self._write_json(status, payload)
+                except _CLIENT_DISCONNECTED:
+                    logger.warning("客户端在 JSON 响应写回前断开 path=%s", self.path)
+
+            def _parse_content_length(self) -> int:
+                raw_value = self.headers.get("Content-Length", "0").strip()
+                try:
+                    return int(raw_value or "0")
+                except ValueError as exc:
+                    raise ValueError(f"无效的 Content-Length: {raw_value}") from exc
+
+            def _write_sse_error(self, message: str, error_type: str) -> None:
+                event = {
+                    "error": {
+                        "message": message,
+                        "type": error_type,
+                    }
+                }
+                try:
+                    payload = f"data: {json.dumps(event, ensure_ascii=False, separators=(',', ':'))}\n\n".encode("utf-8")
+                    self.wfile.write(payload)
+                    self.wfile.flush()
+                except _CLIENT_DISCONNECTED:
+                    logger.warning("客户端在 SSE 错误写回前断开 path=%s", self.path)
+
+            def _safe_http_status(self, value: int, fallback: HTTPStatus) -> HTTPStatus:
+                try:
+                    return HTTPStatus(value)
+                except ValueError:
+                    return fallback
+
+            def _debug_log_request_start(self) -> None:
+                debug_dump(
+                    logger,
+                    config.debug_dump_all,
+                    f"HTTP 入站请求 {self.command} {self.path} headers",
+                    {key: value for key, value in self.headers.items()},
+                )
+
+            def _path_without_query(self) -> str:
+                return urlparse(self.path).path
+
+            def log_message(self, format: str, *args) -> None:
+                logger.info("%s - %s", self.address_string(), format % args)
+
+        return RequestHandler

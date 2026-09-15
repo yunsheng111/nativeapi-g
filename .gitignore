@@ -1,0 +1,21 @@
+# ==== 凭据（绝不可入库）====
+token.txt
+accounts.json
+.env
+.glmrelay/
+
+# ==== 运行产物 ====
+_fail_samples/
+_server*.log
+_verify.txt
+**/__pycache__/
+*.py[oc]
+
+# ==== 外部仓库 / 工具目录（各自独立，不入本库）====
+_research/
+.mimosa/
+.workbuddy/
+artifacts/
+
+# ==== 虚拟环境 ====
+.venv/

@@ -1,0 +1,34 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Config
+.env
+
+log
+docs
+
+main.spec
+tokenizer.json
+
+# Temp deploy files
+*.pyc
+__pycache__/
+token.txt
+check*.py
+fix*.py
+upload*.py
+verify*.py
+deploy*.py
+
+# IDE/tool dirs
+.lrnev/
+.reasonix/
+.kunsdd/

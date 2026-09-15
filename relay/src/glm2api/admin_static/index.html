@@ -1,0 +1,789 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>glm2api Admin</title>
+  <link rel="icon" href="data:,">
+  <script src="/admin/lib/vue.global.prod.js"></script>
+  <script src="/admin/lib/naive-ui.prod.js"></script>
+  <style>
+    :root {
+      --bg: #f5f7fb; --panel: #fff; --line: #d9e1ec;
+      --text: #1f2937; --muted: #64748b; --accent: #1677b3;
+      --accent-soft: #e7f2fb; --danger-soft: #fff1f0;
+      --mono: "JetBrains Mono", Consolas, monospace;
+      --sans: "Geist", "Segoe UI", Arial, sans-serif;
+    }
+    * { box-sizing: border-box; } body { margin: 0; color: var(--text); background: var(--bg); font-family: var(--sans); }
+    [v-cloak] { display: none; }
+    .login-shell { min-height: 100dvh; display: grid; grid-template-columns: 1fr 400px; background: linear-gradient(120deg, rgba(22,119,179,.08), transparent 36%), linear-gradient(180deg, #fbfcfe, #edf2f7); }
+    .login-brief { display: flex; flex-direction: column; justify-content: space-between; padding: 56px 64px; border-right: 1px solid var(--line); }
+    .brand-mark { display: inline-flex; width: 42px; height: 42px; align-items: center; justify-content: center; border-radius: 10px; background: #1a365d; color: #fff; font-family: var(--mono); font-weight: 700; }
+    .login-title { margin: 0; font-size: 38px; line-height: 1.1; font-weight: 760; }
+    .login-subtitle { max-width: 480px; color: var(--muted); font-size: 15px; line-height: 1.7; }
+    .login-card { display: flex; align-items: center; justify-content: center; padding: 36px; background: rgba(255,255,255,.72); backdrop-filter: blur(14px); }
+    .login-panel { width: 100%; max-width: 340px; }
+    .app-shell { min-height: 100dvh; display: grid; grid-template-columns: 220px 1fr; }
+    .sidebar { padding: 20px 14px; background: #111827; color: #e5eef7; display: flex; flex-direction: column; gap: 18px; }
+    .sidebar-head { display: flex; align-items: center; gap: 10px; padding-bottom: 12px; border-bottom: 1px solid #1f2937; }
+    .sidebar-head h2 { margin: 0; font-size: 15px; font-weight: 700; letter-spacing: .02em; }
+    .nav-item { padding: 9px 14px; border-radius: 8px; cursor: pointer; transition: background .15s; font-size: 14px; color: #9ca3af; display: flex; align-items: center; gap: 10px; }
+    .nav-item:hover { background: #1f2937; color: #e5eef7; }
+    .nav-item.active { background: #1f2937; color: #fff; font-weight: 600; }
+    .nav-icon { font-size: 18px; width: 24px; text-align: center; }
+    .main { padding: 32px 36px; overflow-y: auto; }
+    .section-title { font-size: 20px; font-weight: 700; margin: 0 0 20px 0; }
+    .card-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 14px; margin-bottom: 24px; }
+    .stat-card { background: var(--panel); border-radius: 10px; padding: 18px 20px; border: 1px solid var(--line); }
+    .stat-card .label { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; }
+    .stat-card .value { font-size: 28px; font-weight: 700; margin-top: 4px; }
+    .data-table { width: 100%; border-collapse: collapse; font-size: 13px; background: var(--panel); border-radius: 10px; overflow: hidden; border: 1px solid var(--line); }
+    .data-table th { background: #f8fafc; padding: 10px 14px; text-align: left; font-weight: 600; color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; border-bottom: 1px solid var(--line); }
+    .data-table td { padding: 10px 14px; border-bottom: 1px solid #f1f5f9; }
+    .data-table tr:last-child td { border-bottom: none; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; }
+    .badge-ok { background: #e6f7ed; color: #15803d; }
+    .badge-err { background: #fef2f2; color: #b91c1c; }
+    .badge-warn { background: #fefce8; color: #a16207; }
+    .badge-info { background: var(--accent-soft); color: var(--accent); }
+    .mono { font-family: var(--mono); font-size: 12px; }
+    .tag-list { display: flex; flex-wrap: wrap; gap: 6px; }
+    .tag { display: inline-block; padding: 3px 10px; background: #f1f5f9; border-radius: 6px; font-size: 12px; color: var(--muted); font-family: var(--mono); }
+    .kv-row { display: flex; padding: 8px 0; border-bottom: 1px solid #f1f5f9; font-size: 13px; }
+    .kv-row:last-child { border-bottom: none; }
+    .kv-key { width: 200px; color: var(--muted); flex-shrink: 0; font-weight: 500; }
+    .kv-val { font-family: var(--mono); word-break: break-all; }
+    .log-line { padding: 4px 10px; font-family: var(--mono); font-size: 12px; border-bottom: 1px solid #f1f5f9; white-space: pre-wrap; }
+    .log-debug { border-left: 3px solid #94a3b8; background: #f8fafc; }
+    .log-info { border-left: 3px solid #22c55e; background: #f0fdf4; }
+    .log-warning { border-left: 3px solid #eab308; background: #fefce8; }
+    .log-error { border-left: 3px solid #ef4444; background: #fef2f2; }
+    .log-critical { border-left: 3px solid #dc2626; background: #fef2f2; font-weight: 700; }
+    .empty-state { text-align: center; padding: 40px; color: var(--muted); }
+    .import-status { border: 1px solid var(--line); border-left: 3px solid var(--muted); border-radius: 10px; background: var(--panel); padding: 14px 18px; margin-bottom: 18px; }
+    .import-status.is-waiting_login { border-left-color: var(--accent); background: var(--accent-soft); }
+    .import-status.is-starting { border-left-color: #a16207; }
+    .import-status.is-error { border-left-color: #b91c1c; background: var(--danger-soft); }
+    .import-state { font-size: 14px; font-weight: 600; margin-bottom: 6px; }
+    .import-meta { font-size: 12px; color: var(--muted); font-family: var(--mono); }
+    .import-err { margin-top: 6px; font-size: 12px; color: #b91c1c; font-family: var(--mono); word-break: break-all; }
+    .import-warn { margin-top: 8px; font-size: 12px; color: #a16207; background: #fefce8; border-radius: 6px; padding: 8px 10px; }
+    .captured-row { display: flex; align-items: center; gap: 10px; padding: 4px 0; font-size: 12px; }
+    .hint-text { font-size: 12px; color: var(--muted); line-height: 1.8; }
+    .pagination { display: flex; gap: 6px; align-items: center; padding: 12px 0; }
+    .pagination button { padding: 4px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); cursor: pointer; font-size: 12px; color: var(--text); }
+    .pagination button:hover { background: var(--accent-soft); }
+    .pagination button:disabled { opacity: .4; cursor: default; }
+    .pagination .page-info { font-size: 12px; color: var(--muted); margin: 0 8px; }
+    .env-box { background: #0f172a; color: #e2e8f0; padding: 14px; border-radius: 8px; font-family: var(--mono); font-size: 12px; white-space: pre-wrap; overflow-x: auto; max-height: 400px; overflow-y: auto; line-height: 1.5; }
+    @media (max-width: 768px) {
+      .login-shell { grid-template-columns: 1fr; }
+      .login-brief { display: none; }
+      .app-shell { grid-template-columns: 1fr; }
+      .sidebar { display: none; }
+      .main { padding: 16px; }
+    }
+  </style>
+</head>
+<body>
+<div id="app" v-cloak>
+  <!-- ── Login ───────────────────────────────────────────── -->
+  <div v-if="!authenticated" class="login-shell">
+    <div class="login-brief">
+      <div>
+        <div class="brand-mark">G2A</div>
+        <h1 class="login-title" style="margin-top:30px">glm2api<br>管理面板</h1>
+        <p class="login-subtitle" style="margin-top:20px">
+          查看服务状态、管理账号 Token、浏览实时日志与请求记录，以及一键测试模型对话。
+        </p>
+      </div>
+      <p style="color:var(--muted);font-size:13px">glm2api v0.1.0 · 零依赖 · 纯 stdlib</p>
+    </div>
+    <div class="login-card">
+      <div class="login-panel">
+        <h3 style="margin:0 0 20px 0;font-size:18px;font-weight:700">登录管理面板</h3>
+        <input v-model="loginKey" type="password" placeholder="输入 ADMIN_KEY" @keyup.enter="doLogin"
+          style="width:100%;padding:10px 14px;border:1px solid #d9e1ec;border-radius:8px;font-size:14px;outline:none;box-sizing:border-box" />
+        <button @click="doLogin" :disabled="loginLoading"
+          style="width:100%;margin-top:10px;padding:10px;border:none;border-radius:8px;background:#1677b3;color:#fff;font-size:14px;cursor:pointer;font-weight:600">
+          {{ loginLoading ? '登录中...' : '登录' }}
+        </button>
+        <p v-if="loginError" style="color:#b91c1c;font-size:13px;margin-top:8px">{{ loginError }}</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Main app ────────────────────────────────────────── -->
+  <div v-else class="app-shell">
+    <aside class="sidebar">
+      <div class="sidebar-head">
+        <div class="brand-mark" style="width:32px;height:32px;font-size:11px">G2A</div>
+        <h2>glm2api</h2>
+      </div>
+      <div v-for="nav in navs" :key="nav.id" class="nav-item" :class="{active: activeNav===nav.id}" @click="activeNav=nav.id">
+        <span class="nav-icon">{{ nav.icon }}</span> {{ nav.label }}
+      </div>
+      <div style="flex:1"></div>
+      <div class="nav-item" @click="doLogout" style="color:#f87171">
+        <span class="nav-icon">⇥</span> 退出
+      </div>
+    </aside>
+
+    <main class="main">
+      <!-- ── Dashboard ────────────────────────────────────── -->
+      <template v-if="activeNav==='overview'">
+        <h2 class="section-title">概览</h2>
+        <div class="card-grid">
+          <div class="stat-card"><div class="label">账号数</div><div class="value">{{ overview.token_count }}</div></div>
+          <div class="stat-card"><div class="label">模型数</div><div class="value">{{ overview.model_count }}</div></div>
+          <div class="stat-card"><div class="label">并发上限</div><div class="value">{{ overview.concurrency }}</div></div>
+          <div class="stat-card"><div class="label">请求成功率</div><div class="value" :style="{color: overview.total>0 && overview.success/overview.total>.9 ? '#15803d' : '#b91c1c'}">{{ overview.total ? (overview.success/overview.total*100).toFixed(1)+'%' : '--' }}</div></div>
+        </div>
+        <div class="card-grid" style="grid-template-columns: repeat(auto-fill, minmax(120px,1fr))">
+          <div class="stat-card"><div class="label">总请求</div><div class="value" style="font-size:22px">{{ overview.total || 0 }}</div></div>
+          <div class="stat-card"><div class="label">成功</div><div class="value" style="font-size:22px;color:#15803d">{{ overview.success || 0 }}</div></div>
+          <div class="stat-card"><div class="label">失败</div><div class="value" style="font-size:22px;color:#b91c1c">{{ overview.error || 0 }}</div></div>
+          <div class="stat-card"><div class="label">均耗时</div><div class="value" style="font-size:22px">{{ overview.avg_ms || 0 }}ms</div></div>
+          <div class="stat-card"><div class="label">游客模式</div><div class="value" style="font-size:16px;margin-top:8px"><span :class="'badge '+(overview.guest_mode?'badge-warn':'badge-ok')">{{ overview.guest_mode ? '开启' : '关闭' }}</span></div></div>
+        </div>
+      </template>
+
+      <!-- ── Config (最多显示5行) ──────────────────────────── -->
+      <template v-if="activeNav==='config'">
+        <h2 class="section-title">配置</h2>
+        <div class="stat-card" style="margin-bottom:20px" v-if="configData">
+          <div class="kv-row" v-for="(v,k) in configTop5(configData)" :key="k">
+            <span class="kv-key">{{ k }}</span>
+            <span class="kv-val">{{ typeof v==='object' ? JSON.stringify(v) : String(v) }}</span>
+          </div>
+        </div>
+        <n-text depth="3" v-else>加载中...</n-text>
+      </template>
+
+      <!-- ── API Keys ──────────────────────────────────────── -->
+      <template v-if="activeNav==='api-keys'">
+        <h2 class="section-title">API Key 管理</h2>
+        <div style="margin-bottom:14px;display:flex;gap:10px;align-items:center">
+          <n-button type="primary" size="small" @click="openCreateApiKey">➕ 添加 Key</n-button>
+          <n-text depth="3" style="font-size:12px">{{ apiKeys.length }} 个 Key · {{ apiKeys.filter(k=>k.enabled).length }} 个启用</n-text>
+          <n-tag v-if="configData && !configData.auth_enabled" type="info" size="small">当前免认证</n-tag>
+          <n-tag v-else-if="configData" type="warning" size="small">认证已开启</n-tag>
+        </div>
+        <table class="data-table" v-if="apiKeys.length">
+          <thead><tr><th>名称</th><th>密钥</th><th>状态</th><th>创建时间</th><th style="width:180px">操作</th></tr></thead>
+          <tbody>
+            <tr v-for="k in apiKeys" :key="k.name">
+              <td class="mono">{{ k.name }}</td>
+              <td class="mono" style="color:var(--muted)">{{ k.key }}</td>
+              <td><span :class="'badge '+(k.enabled?'badge-ok':'badge-err')">{{ k.enabled ? '启用' : '禁用' }}</span></td>
+              <td class="mono" style="color:var(--muted);font-size:11px">{{ k.created_at }}</td>
+              <td>
+                <n-button size="tiny" @click="openEditApiKey(k)" style="margin-right:4px">更新</n-button>
+                <n-button size="tiny" @click="toggleApiKey(k.name)" :type="k.enabled?'warning':'success'" style="margin-right:4px">{{ k.enabled ? '禁用' : '启用' }}</n-button>
+                <n-button size="tiny" type="error" @click="deleteApiKey(k.name)">删除</n-button>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="empty-state" v-else>暂无 API Key</div>
+
+        <n-modal v-model:show="apiKeyDialog" preset="card" :title="apiKeyFormMode==='create'?'添加 API Key':'更新 API Key'" style="width:440px">
+          <n-space vertical>
+            <n-input v-model:value="apiKeyFormName" placeholder="Key 名称" :disabled="apiKeyFormMode==='edit'"></n-input>
+            <n-input v-model:value="apiKeyFormKey" type="password" show-password-on="click" :placeholder="apiKeyFormMode==='create'?'输入密钥':'新密钥（留空不修改）'" @keyup.enter="saveApiKey"></n-input>
+            <n-text v-if="apiKeyError" type="error" depth="3">{{ apiKeyError }}</n-text>
+          </n-space>
+          <template #footer>
+            <n-button @click="apiKeyDialog=false">取消</n-button>
+            <n-button type="primary" @click="saveApiKey" :loading="apiKeySaving">保存</n-button>
+          </template>
+        </n-modal>
+      </template>
+
+      <!-- ── Tokens (分页, 每页10个) ───────────────────────── -->
+      <template v-if="activeNav==='tokens'">
+        <h2 class="section-title">账号 Token</h2>
+        <table class="data-table" v-if="tokensPaged.length">
+          <thead><tr><th>#</th><th>前缀</th><th>脱敏值</th><th>类型</th></tr></thead>
+          <tbody>
+            <tr v-for="t in tokensPaged" :key="t.index">
+              <td>{{ t.index }}</td>
+              <td class="mono">{{ t.prefix }}</td>
+              <td class="mono">{{ t.masked }}</td>
+              <td><span :class="'badge '+(/游客/.test(t.prefix)?'badge-warn':'badge-info')">{{ /游客/.test(t.prefix) ? '游客' : '账号' }}</span></td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="empty-state" v-else-if="configData && configData.tokens">暂无数据</div>
+        <div class="empty-state" v-else-if="!configData">加载中...</div>
+
+        <!-- 分页 -->
+        <div class="pagination" v-if="tokenTotalPages>1">
+          <button :disabled="tokenPage<=1" @click="tokenPage=1">首页</button>
+          <button :disabled="tokenPage<=1" @click="tokenPage--">上一页</button>
+          <span class="page-info">第 {{ tokenPage }} / {{ tokenTotalPages }} 页，共 {{ tokenTotal }} 条</span>
+          <button :disabled="tokenPage>=tokenTotalPages" @click="tokenPage++">下一页</button>
+          <button :disabled="tokenPage>=tokenTotalPages" @click="tokenPage=tokenTotalPages">末页</button>
+        </div>
+
+        <div class="card-grid" style="margin-top:16px" v-if="configData">
+          <div class="stat-card"><div class="label">Token 来源</div><div class="value" style="font-size:16px;margin-top:8px">{{ configData.token_source }}</div></div>
+          <div class="stat-card"><div class="label">Token 总数</div><div class="value">{{ configData.token_count }}</div></div>
+        </div>
+      </template>
+
+      <!-- ── 账号池 (登录导入 / 粘贴导入) ───────────────────── -->
+      <template v-if="activeNav==='accounts'">
+        <h2 class="section-title">账号池</h2>
+
+        <div class="card-grid">
+          <div class="stat-card"><div class="label">账号总数</div><div class="value">{{ accountStats.token_count || 0 }}</div></div>
+          <div class="stat-card"><div class="label">含 device_id</div><div class="value">{{ accountStats.with_device_id || 0 }}</div></div>
+          <div class="stat-card"><div class="label">登录导入</div><div class="value">{{ accountStats.imported || 0 }}</div></div>
+          <div class="stat-card"><div class="label">粘贴导入</div><div class="value">{{ accountStats.pasted || 0 }}</div></div>
+        </div>
+
+        <div style="display:flex;gap:8px;align-items:center;margin-bottom:14px;flex-wrap:wrap">
+          <n-select v-model:value="importBrowser" :options="browserOpts" size="small" style="width:120px"></n-select>
+          <n-button size="small" type="primary" @click="startImport" :loading="importBusy" :disabled="importRunning">一键登录导入</n-button>
+          <n-button size="small" @click="stopImport" :loading="importBusy" :disabled="!importRunning">结束导入</n-button>
+          <n-button size="small" @click="fetchAccounts" :loading="accountsLoading">刷新</n-button>
+        </div>
+
+        <div v-if="importSession" class="import-status" :class="'is-'+importSession.state">
+          <div class="import-state">
+            <span class="badge" :class="importBadgeClass">{{ importStateLabel }}</span>
+            <span style="margin-left:8px">{{ importSession.message }}</span>
+          </div>
+          <div class="import-meta">
+            {{ importSession.browser || '—' }} · 调试端口 {{ importSession.debug_port }} · 已轮询 {{ importSession.poll_count }} 次 · 本次抓取 {{ importSession.captured_count }} 个
+          </div>
+          <div v-if="importSession.last_error" class="import-err">最近错误：{{ importSession.last_error }}</div>
+          <div v-if="importSession.captured && importSession.captured.length" style="margin-top:8px">
+            <div v-for="c in importSession.captured" :key="c.fingerprint" class="captured-row">
+              <span class="badge badge-info">已导入</span>
+              <span class="mono">{{ c.token_masked }}</span>
+              <span class="mono" style="color:var(--muted)">{{ c.device_id ? 'device ' + c.device_id : '无 device_id' }}</span>
+            </div>
+          </div>
+          <div v-if="importSession.restart_required" class="import-warn">{{ importSession.note }}</div>
+        </div>
+
+        <table class="data-table" v-if="accounts.length">
+          <thead><tr><th>#</th><th>备注</th><th>Token</th><th>device_id</th><th>来源</th><th>导入时间</th><th></th></tr></thead>
+          <tbody>
+            <tr v-for="a in accounts" :key="a.fingerprint">
+              <td>{{ a.index + 1 }}</td>
+              <td>{{ a.label }}</td>
+              <td class="mono">{{ a.token_masked }}</td>
+              <td class="mono">{{ a.device_id || '—' }}</td>
+              <td><span class="badge" :class="a.source==='browser-login'?'badge-info':'badge-warn'">{{ sourceLabel(a.source) }}</span></td>
+              <td class="mono">{{ a.imported_at || '—' }}</td>
+              <td><n-button size="tiny" quaternary type="error" @click="deleteAccount(a)">删除</n-button></td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="empty-state" v-else-if="accountsLoading">加载中...</div>
+        <div class="empty-state" v-else>
+          还没有账号。<br>
+          点「一键登录导入」会弹出一个独立窗口的浏览器，在里面登录智谱清言，refresh_token 会自动抓取并去重写入。
+          窗口会保持打开，可以登出后继续登录下一个账号。
+        </div>
+
+        <h3 style="font-size:15px;font-weight:700;margin:26px 0 8px">粘贴导入</h3>
+        <div class="hint-text">
+          不想开浏览器时用这个。支持裸 token、DevTools 里复制的键值对、JSON 片段、
+          <span class="mono">GLM_REFRESH_TOKEN=xxx</span> 等形式，一次可以粘多条。
+        </div>
+        <n-input v-model:value="pasteText" type="textarea" :rows="4" style="margin-top:8px" placeholder="把复制到的内容粘贴到这里..."></n-input>
+        <div style="margin-top:8px;display:flex;gap:10px;align-items:center">
+          <n-button size="small" @click="pasteImport" :loading="pasteBusy" :disabled="!pasteText.trim()">导入</n-button>
+          <n-button size="small" quaternary @click="pasteText='';pasteResult=null" v-if="pasteText">清空</n-button>
+          <n-text v-if="pasteResult" depth="3" style="font-size:12px">
+            新增 {{ pasteResult.added.length }} 条，跳过 {{ pasteResult.skipped.length }} 条
+          </n-text>
+        </div>
+      </template>
+
+      <!-- ── Logs (最新在最上, 按级别配色) ──────────────────── -->
+      <template v-if="activeNav==='logs'">
+        <h2 class="section-title">实时日志</h2>
+        <div style="margin-bottom:12px;display:flex;gap:8px;align-items:center">
+          <n-button size="small" @click="fetchLogs" :loading="logsLoading">刷新</n-button>
+          <n-select v-model:value="logLevelFilter" :options="logLevelOpts" size="small" style="width:100px" placeholder="全部级别" clearable></n-select>
+          <n-switch v-model:value="logsAutoRefresh" size="small"></n-switch> <n-text depth="3" style="font-size:12px">自动刷新</n-text>
+          <n-text depth="3" style="font-size:12px;margin-left:auto">{{ logs.length }} 条</n-text>
+        </div>
+        <div style="background:var(--panel);border:1px solid var(--line);border-radius:10px;max-height:520px;overflow-y:auto" v-if="logs.length">
+          <div v-for="l in logsSorted" :key="l.id" :class="'log-line ' + logClass(l.level)">
+            <span style="color:var(--muted)">{{ l.time }}</span>
+            <span :style="{color: levelColor(l.level), fontWeight: l.level==='ERROR'||l.level==='CRITICAL'?'700':'500'}"> {{ l.level }}</span>
+            <span style="color:var(--muted)"> [{{ l.logger }}]</span> {{ l.msg }}
+          </div>
+        </div>
+        <div class="empty-state" v-else>暂无日志</div>
+      </template>
+
+      <!-- ── Requests ──────────────────────────────────────── -->
+      <template v-if="activeNav==='requests'">
+        <h2 class="section-title">请求记录</h2>
+        <div style="margin-bottom:12px;display:flex;gap:8px">
+          <n-button size="small" @click="fetchRequests" :loading="reqsLoading">刷新</n-button>
+          <n-button size="small" @click="clearRequests" type="error" ghost>清空</n-button>
+          <n-text depth="3" style="font-size:12px;margin-left:auto;align-self:center">{{ requests.length }} 条</n-text>
+        </div>
+        <table class="data-table" v-if="requests.length">
+          <thead><tr><th>时间</th><th>方法</th><th>路径</th><th>模型</th><th>状态</th><th>耗时</th></tr></thead>
+          <tbody>
+            <tr v-for="r in requests" :key="r.id">
+              <td class="mono">{{ r.time }}</td>
+              <td>{{ r.method }}</td>
+              <td class="mono" style="max-width:200px;overflow:hidden;text-overflow:ellipsis">{{ r.path }}</td>
+              <td class="mono">{{ r.model || '--' }}</td>
+              <td><span :class="'badge '+(r.status<300?'badge-ok':r.status<400?'badge-warn':'badge-err')">{{ r.status }}</span></td>
+              <td>{{ r.duration_ms }}ms</td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="empty-state" v-else>暂无请求记录</div>
+      </template>
+
+      <!-- ── Chat Test (参考 freebuff2api 风格) ────────────── -->
+      <template v-if="activeNav==='chat'">
+        <h2 class="section-title">对话测试</h2>
+        <n-card style="max-width:720px;margin-bottom:16px">
+          <n-space vertical size="medium">
+            <n-select v-model:value="chatModel" :options="modelOptions" placeholder="选择模型" filterable></n-select>
+            <n-input v-model:value="chatPrompt" type="textarea" :rows="4" placeholder="输入提示词..."></n-input>
+            <n-input v-model:value="chatSystem" type="textarea" :rows="2" placeholder="System Prompt（可选）"></n-input>
+            <div style="display:flex;gap:8px">
+              <n-button type="primary" @click="doChatTest" :loading="chatLoading">发送请求</n-button>
+              <n-button @click="loadModels">刷新模型</n-button>
+              <n-button @click="clearChatResult">清除</n-button>
+            </div>
+          </n-space>
+        </n-card>
+
+        <n-card title="调用结果" style="max-width:720px">
+          <div v-if="!chatResult" style="color:var(--muted);font-size:13px;padding:8px 0">尚未发送请求</div>
+          <div v-else>
+            <div style="margin-bottom:8px">
+              <span class="badge" :class="chatResult.ok?'badge-ok':'badge-err'">{{ chatResult.ok ? '成功' : '失败' }}</span>
+              <span style="margin-left:8px;color:var(--muted);font-size:12px">
+                模型: {{ chatResult.model || chatModel }} · 耗时: {{ chatResult.duration_ms || '--' }}ms
+              </span>
+            </div>
+            <pre class="env-box">{{ chatResultText }}</pre>
+          </div>
+        </n-card>
+      </template>
+    </main>
+  </div>
+</div>
+
+<script>
+const { createApp, ref, computed, onMounted, onUnmounted, watch } = Vue;
+const naive = window.naive;
+
+const naiveComponents = ['NButton','NInput','NSelect','NSpace','NH3','NText','NCard','NSwitch','NModal','NTag','NH2','NH1'];
+const app = createApp({
+  components: naiveComponents.reduce((acc, name) => { acc[name] = naive[name]; return acc; }, {}),
+  setup() {
+    const authenticated = ref(false);
+    const loginKey = ref('');
+    const loginLoading = ref(false);
+    const loginError = ref('');
+    const activeNav = ref('overview');
+    const navs = [
+      { id: 'overview', label: '概览', icon: '◉' },
+      { id: 'accounts', label: '账号池', icon: '◈' },
+      { id: 'config', label: '配置', icon: '⚙' },
+      { id: 'tokens', label: 'Token', icon: '🔑' },
+      { id: 'api-keys', label: 'API Key', icon: '🔐' },
+      { id: 'logs', label: '日志', icon: '📋' },
+      { id: 'requests', label: '请求记录', icon: '📊' },
+      { id: 'chat', label: '对话测试', icon: '💬' },
+    ];
+
+    const overview = ref({});
+    const configData = ref(null);
+    const logs = ref([]);
+    const logsLoading = ref(false);
+    const logsAutoRefresh = ref(false);
+    const logLevelFilter = ref(null);
+    const logLevelOpts = [
+      { label: 'DEBUG', value: 'DEBUG' }, { label: 'INFO', value: 'INFO' },
+      { label: 'WARNING', value: 'WARNING' }, { label: 'ERROR', value: 'ERROR' },
+    ];
+    const requests = ref([]);
+    const reqsLoading = ref(false);
+
+    // ── Chat Test ────────────────────────────────────────────
+    const chatModel = ref('glm-4-flash');
+    const chatPrompt = ref('你好，请用一句话介绍你自己');
+    const chatSystem = ref('');
+    const chatLoading = ref(false);
+    const chatResult = ref(null);
+    const modelOptions = ref([]);
+
+    // ── Tokens pagination ────────────────────────────────────
+    const tokenPage = ref(1);
+    const tokenPageSize = 10;
+
+    // ── 账号池 / 登录导入 ────────────────────────────────────
+    const accounts = ref([]);
+    const accountStats = ref({});
+    const accountsLoading = ref(false);
+    const importSession = ref(null);
+    const importBusy = ref(false);
+    const importBrowser = ref('edge');
+    const browserOpts = [{ label: 'Edge', value: 'edge' }, { label: 'Chrome', value: 'chrome' }];
+    const pasteText = ref('');
+    const pasteBusy = ref(false);
+    const pasteResult = ref(null);
+    let importTimer = null;
+
+    const importRunning = computed(() => {
+      const s = importSession.value;
+      return !!s && (s.state === 'starting' || s.state === 'waiting_login');
+    });
+    const importStateLabel = computed(() => {
+      const s = importSession.value;
+      if (!s) return '';
+      const map = { created: '未启动', starting: '启动中', waiting_login: '等待登录', stopped: '已结束', error: '出错' };
+      return map[s.state] || s.state;
+    });
+    const importBadgeClass = computed(() => {
+      const s = importSession.value;
+      if (!s) return 'badge-info';
+      return s.state === 'waiting_login' ? 'badge-info' : (s.state === 'error' ? 'badge-warn' : 'badge-warn');
+    });
+
+    function sourceLabel(src) {
+      const map = { 'browser-login': '登录导入', paste: '粘贴导入' };
+      return map[src] || '手动';
+    }
+
+    function applyAccounts(data) {
+      if (!data) return;
+      accounts.value = data.accounts || accounts.value;
+      accountStats.value = data.stats || accountStats.value;
+      if ('session' in data) importSession.value = data.session;
+    }
+
+    async function fetchAccounts() {
+      accountsLoading.value = true;
+      try { applyAccounts(await api('/admin/api/accounts')); } catch (e) {}
+      finally { accountsLoading.value = false; }
+    }
+
+    function startImportTimer() {
+      if (importTimer) { clearInterval(importTimer); importTimer = null; }
+      importTimer = setInterval(async () => {
+        if (!importRunning.value) { clearInterval(importTimer); importTimer = null; return; }
+        try { applyAccounts(await api('/admin/api/accounts/import/status')); } catch (e) {}
+      }, 2000);
+    }
+
+    async function startImport() {
+      importBusy.value = true;
+      pasteResult.value = null;
+      try {
+        const data = await api('/admin/api/accounts/import/start', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ browser: importBrowser.value, headless: false }),
+        });
+        applyAccounts(data);
+        startImportTimer();
+      } catch (e) {
+        importSession.value = { state: 'error', message: '启动失败：' + e.message, captured: [] };
+      } finally { importBusy.value = false; }
+    }
+
+    async function stopImport() {
+      importBusy.value = true;
+      try {
+        applyAccounts(await api('/admin/api/accounts/import/stop', { method: 'POST' }));
+      } catch (e) {}
+      finally {
+        importBusy.value = false;
+        if (importTimer) { clearInterval(importTimer); importTimer = null; }
+      }
+    }
+
+    async function deleteAccount(row) {
+      if (!confirm('确定要从 token.txt 中删除账号 ' + row.label + ' 吗？')) return;
+      try {
+        applyAccounts(await api('/admin/api/accounts/delete', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ fingerprint: row.fingerprint }),
+        }));
+      } catch (e) { alert('删除失败：' + e.message); }
+    }
+
+    async function pasteImport() {
+      pasteBusy.value = true;
+      pasteResult.value = null;
+      try {
+        const data = await api('/admin/api/accounts/paste', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text: pasteText.value }),
+        });
+        pasteResult.value = data;
+        applyAccounts(data);
+        if (data.added && data.added.length) pasteText.value = '';
+      } catch (e) { alert('导入失败：' + e.message); }
+      finally { pasteBusy.value = false; }
+    }
+
+    onUnmounted(() => { if (importTimer) clearInterval(importTimer); });
+
+    // ── API Key management ──────────────────────────────────
+    const apiKeys = ref([]);
+    const apiKeyDialog = ref(false);
+    const apiKeyFormMode = ref('create');
+    const apiKeyFormName = ref('');
+    const apiKeyFormKey = ref('');
+    const apiKeySaving = ref(false);
+    const apiKeyError = ref('');
+
+    let logTimer = null;
+    let reqTimer = null;
+
+    // ── Helpers ──────────────────────────────────────────────
+    function configTop5(data) {
+      if (!data) return {};
+      const keys = Object.keys(data).slice(0, 5);
+      const result = {};
+      keys.forEach(k => result[k] = data[k]);
+      return result;
+    }
+
+    function logClass(level) {
+      const map = {DEBUG:'log-debug',INFO:'log-info',WARNING:'log-warning',ERROR:'log-error',CRITICAL:'log-critical'};
+      return map[level] || 'log-debug';
+    }
+
+    function levelColor(level) {
+      const map = {DEBUG:'#64748b',INFO:'#15803d',WARNING:'#a16207',ERROR:'#b91c1c',CRITICAL:'#b91c1c'};
+      return map[level] || '#64748b';
+    }
+
+    // ── Tokens computed ─────────────────────────────────────
+    const tokensList = computed(() => configData.value && configData.value.tokens ? configData.value.tokens : []);
+    const tokenTotal = computed(() => tokensList.value.length);
+    const tokenTotalPages = computed(() => Math.max(1, Math.ceil(tokenTotal.value / tokenPageSize)));
+    const tokensPaged = computed(() => {
+      const start = (tokenPage.value - 1) * tokenPageSize;
+      return tokensList.value.slice(start, start + tokenPageSize);
+    });
+
+    // ── Logs: newest first ────────────────────────────────
+    const logsSorted = computed(() => {
+      const sorted = [...logs.value];
+      sorted.reverse();
+      return sorted;
+    });
+
+    // ── Chat result text ─────────────────────────────────
+    const chatResultText = computed(() => {
+      if (!chatResult.value) return '';
+      return JSON.stringify(chatResult.value, null, 2);
+    });
+
+    // ── API functions ────────────────────────────────────
+    async function api(path, opts = {}) {
+      const headers = { ...opts.headers };
+      const tok = localStorage.getItem('glm2api_admin_session');
+      if (tok) headers['x-admin-session'] = tok;
+      const res = await fetch(path, { credentials: 'same-origin', ...opts, headers });
+      if (res.status === 401 && authenticated.value) { authenticated.value = false; localStorage.removeItem('glm2api_admin_session'); return null; }
+      const d = await res.json();
+      if (d.code !== 0) throw new Error(d.msg || 'API error');
+      return d.data;
+    }
+
+    async function doLogin() {
+      loginLoading.value = true; loginError.value = '';
+      try {
+        const data = await api('/admin/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ key: loginKey.value }) });
+        if (data !== null) {
+          authenticated.value = true;
+          configData.value = data;
+          const tok = data && data._session_token;
+          if (tok) localStorage.setItem('glm2api_admin_session', tok);
+          loginKey.value = '';
+          loadAll();
+        }
+      } catch (e) { loginError.value = e.message; }
+      finally { loginLoading.value = false; }
+    }
+
+    async function checkSession() {
+      try {
+        const tok = localStorage.getItem('glm2api_admin_session');
+        if (tok) { authenticated.value = true; return; }
+        const data = await api('/admin/api/session');
+        if (data && data.authenticated) authenticated.value = true;
+      } catch (e) { /* not logged in */ }
+    }
+
+    async function doLogout() {
+      await api('/admin/api/logout', { method: 'POST' });
+      authenticated.value = false;
+      localStorage.removeItem('glm2api_admin_session');
+    }
+
+    async function fetchOverview() {
+      try { overview.value = await api('/admin/api/overview'); } catch (e) {}
+    }
+    async function fetchConfig() {
+      try { configData.value = await api('/admin/api/config'); } catch (e) {}
+    }
+    async function fetchLogs() {
+      logsLoading.value = true;
+      try {
+        let url = '/admin/api/logs?limit=500';
+        if (logLevelFilter.value) url += '&level=' + logLevelFilter.value;
+        const data = await api(url);
+        if (data) logs.value = data.items || [];
+      } catch (e) {}
+      finally { logsLoading.value = false; }
+    }
+    async function fetchRequests() {
+      reqsLoading.value = true;
+      try {
+        const data = await api('/admin/api/requests?limit=100');
+        if (data) requests.value = data.items || [];
+      } catch (e) {}
+      finally { reqsLoading.value = false; }
+    }
+    async function clearRequests() {
+      await api('/admin/api/requests/clear', { method: 'POST' });
+      requests.value = [];
+    }
+
+    // ── Load models ──────────────────────────────────────────
+    async function loadModels() {
+      try {
+        const data = await api('/admin/api/config');
+        if (data && data.models) {
+          modelOptions.value = data.models.map(m => ({ label: m, value: m }));
+        }
+      } catch (e) {
+        // Fallback: use common models
+        modelOptions.value = [
+          { label: 'glm-4-flash', value: 'glm-4-flash' },
+          { label: 'glm-4', value: 'glm-4' },
+          { label: 'glm-4v', value: 'glm-4v' },
+        ];
+      }
+    }
+
+    // ── Chat Test ────────────────────────────────────────────
+    async function doChatTest() {
+      chatLoading.value = true;
+      chatResult.value = null;
+      const body = { model: chatModel.value, prompt: chatPrompt.value };
+      if (chatSystem.value.trim()) body.system = chatSystem.value;
+      const startTime = Date.now();
+      try {
+        const data = await api('/admin/api/chat-test', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        if (data) {
+          data.duration_ms = Date.now() - startTime;
+          chatResult.value = data;
+        } else {
+          chatResult.value = { ok: false, info: '返回为空', duration_ms: Date.now() - startTime };
+        }
+      } catch (e) {
+        chatResult.value = { ok: false, info: e.message, duration_ms: Date.now() - startTime };
+      }
+      finally { chatLoading.value = false; }
+    }
+
+    function clearChatResult() {
+      chatResult.value = null;
+    }
+
+    // ── API Key CRUD ──────────────────────────────────────
+    async function fetchApiKeys() {
+      try { const d = await api('/admin/api/api-keys'); if (d) apiKeys.value = d.items || []; } catch (e) {}
+    }
+    function openCreateApiKey() {
+      apiKeyFormMode.value = 'create'; apiKeyFormName.value = ''; apiKeyFormKey.value = '';
+      apiKeyError.value = ''; apiKeyDialog.value = true;
+    }
+    function openEditApiKey(rec) {
+      apiKeyFormMode.value = 'edit'; apiKeyFormName.value = rec.name; apiKeyFormKey.value = '';
+      apiKeyError.value = ''; apiKeyDialog.value = true;
+    }
+    async function saveApiKey() {
+      apiKeySaving.value = true; apiKeyError.value = '';
+      try {
+        const name = apiKeyFormName.value.trim();
+        const key = apiKeyFormKey.value.trim();
+        if (apiKeyFormMode.value === 'create') {
+          await api('/admin/api/api-keys', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, key }) });
+        } else {
+          const body = { enabled: true };
+          if (key) body.key = key;
+          await api('/admin/api/api-keys/' + encodeURIComponent(name), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        }
+        apiKeyDialog.value = false;
+        await fetchApiKeys(); await fetchConfig();
+      } catch (e) { apiKeyError.value = e.message; }
+      finally { apiKeySaving.value = false; }
+    }
+    async function deleteApiKey(name) {
+      if (!confirm('确定删除 API Key "' + name + '"？')) return;
+      await api('/admin/api/api-keys/' + encodeURIComponent(name) + '/delete', { method: 'POST' });
+      await fetchApiKeys(); await fetchConfig();
+    }
+    async function toggleApiKey(name) {
+      await api('/admin/api/api-keys/' + encodeURIComponent(name) + '/toggle', { method: 'POST' });
+      await fetchApiKeys(); await fetchConfig();
+    }
+
+    function loadAll() { fetchOverview(); fetchConfig(); fetchLogs(); fetchRequests(); fetchApiKeys(); loadModels(); }
+
+    watch(activeNav, (v) => {
+      if (logTimer) { clearInterval(logTimer); logTimer = null; }
+      if (reqTimer) { clearInterval(reqTimer); reqTimer = null; }
+      if (v === 'logs') { fetchLogs(); logTimer = setInterval(() => { if (logsAutoRefresh.value) fetchLogs(); }, 3000); }
+      if (v === 'requests') { fetchRequests(); reqTimer = setInterval(fetchRequests, 5000); }
+      if (v === 'overview') fetchOverview();
+      if (v === 'accounts') { fetchAccounts().then(() => { if (importRunning.value) startImportTimer(); }); }
+      if (v === 'config' || v === 'tokens') fetchConfig();
+      if (v === 'api-keys') { fetchConfig(); fetchApiKeys(); }
+      if (v === 'chat') { loadModels(); }
+      tokenPage.value = 1;
+    });
+
+    onMounted(() => { checkSession().then(() => { if (authenticated.value) loadAll(); }); });
+    onUnmounted(() => { if (logTimer) clearInterval(logTimer); if (reqTimer) clearInterval(reqTimer); });
+
+    return {
+      authenticated, loginKey, loginLoading, loginError, doLogin, doLogout,
+      activeNav, navs, overview, configData,
+      logs, logsLoading, logsAutoRefresh, logLevelFilter, logLevelOpts, fetchLogs,
+      requests, reqsLoading, fetchRequests, clearRequests,
+      chatModel, chatPrompt, chatSystem, chatLoading, chatResult, modelOptions,
+      doChatTest, clearChatResult, loadModels, chatResultText,
+      apiKeys, apiKeyDialog, apiKeyFormMode, apiKeyFormName, apiKeyFormKey,
+      apiKeySaving, apiKeyError, fetchApiKeys, openCreateApiKey, openEditApiKey,
+      saveApiKey, deleteApiKey, toggleApiKey,
+      tokenPage, tokensPaged, tokenTotalPages, tokenTotal,
+      configTop5, logClass, levelColor, logsSorted,
+      accounts, accountStats, accountsLoading, importSession, importBusy,
+      importBrowser, browserOpts, importRunning, importStateLabel, importBadgeClass,
+      pasteText, pasteBusy, pasteResult, fetchAccounts, startImport, stopImport,
+      deleteAccount, pasteImport, sourceLabel,
+    };
+  }
+});
+app.use(naive);
+app.mount('#app');
+</script>
+</body>
+</html>
