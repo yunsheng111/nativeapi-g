@@ -22,6 +22,7 @@ from logging import Logger
 from typing import Callable
 
 from ..config import AppConfig
+from ..core.transport import open_upstream
 from ..logging_utils import debug_dump
 from .glm_auth import GLMAccessTokenManager, build_sign
 from .translator import (
@@ -129,6 +130,10 @@ class GLMWebClient:
         self.config = config
         self.logger = logger
         self.auth = GLMAccessTokenManager(config=config, logger=logger)
+        # 传输 seam 目标校验策略：默认阻断私网目标（自建内网上游可经 .env 放宽）
+        from ..core.transport import set_upstream_policy
+
+        set_upstream_policy(block_private=config.glm_transport_block_private)
         # 单身份单飞（D3）：同一账号同时只跑一条上游流。锁与账号槽一一对应，
         # 每个请求至多持有一把，无锁序死锁面。
         self._account_locks = [threading.Lock() for _ in range(max(1, len(config.glm_refresh_tokens)))]
@@ -361,7 +366,7 @@ class GLMWebClient:
                 )
                 request.headers["X-Request-Id"] = self.auth.next_request_id_for_account(account_index)
                 request.headers["X-Device-Id"] = self.auth.get_device_id_for_account(account_index)
-                return urllib.request.urlopen(request, timeout=self.config.request_timeout)
+                return open_upstream(request, timeout=self.config.request_timeout)
 
             with self._call_with_account_failover("delete_conversation", send_request) as response: # type: ignore
                 payload = self.auth.read_json_response(response)
@@ -472,7 +477,7 @@ class GLMWebClient:
                         dict(request.header_items()),
                     )
                     return self._prepare_chat_response(
-                        urllib.request.urlopen(request, timeout=self.config.request_timeout)
+                        open_upstream(request, timeout=self.config.request_timeout)
                     )
                 except urllib.error.HTTPError as exc:
                     error_payload = self._read_error_payload(exc)
@@ -575,7 +580,7 @@ class GLMWebClient:
                 dict(request.header_items()),
             )
             try:
-                return self._prepare_chat_response(urllib.request.urlopen(request, timeout=self.config.request_timeout))
+                return self._prepare_chat_response(open_upstream(request, timeout=self.config.request_timeout))
             except urllib.error.HTTPError as exc:
                 error_payload = self._read_error_payload(exc)
                 message = self._build_error_message(exc.code, error_payload)
@@ -699,7 +704,7 @@ class GLMWebClient:
 
     def _download_image_as_base64(self, image_url: str) -> str:
         try:
-            with urllib.request.urlopen(image_url, timeout=self.config.request_timeout) as response:
+            with open_upstream(image_url, timeout=self.config.request_timeout) as response:
                 image_bytes = response.read()
             return base64.b64encode(image_bytes).decode("ascii")
         except Exception as exc:
@@ -873,7 +878,7 @@ class GLMWebClient:
                     f"转发到 GLM 的 file_upload 原始请求体 account={account_index}",
                     body,
                 )
-                return urllib.request.urlopen(request, timeout=self.config.request_timeout)
+                return open_upstream(request, timeout=self.config.request_timeout)
 
             with self._call_with_account_failover("file_upload", send_request) as response: # type: ignore
                 result = self.auth.read_json_response(response).get("result", {})
@@ -899,7 +904,7 @@ class GLMWebClient:
 
         parsed = urllib.parse.urlparse(file_url)
         filename = parsed.path.rsplit("/", 1)[-1] or f"upload-{uuid.uuid4().hex}.bin"
-        with urllib.request.urlopen(file_url, timeout=self.config.request_timeout) as response:
+        with open_upstream(file_url, timeout=self.config.request_timeout) as response:
             payload = response.read(FILE_SIZE_LIMIT + 1)
             if len(payload) > FILE_SIZE_LIMIT:
                 raise ValueError("文件超过 100MB，拒绝上传。")

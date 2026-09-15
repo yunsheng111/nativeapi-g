@@ -14,6 +14,7 @@ from logging import Logger
 from typing import Callable
 
 from ..config import AppConfig, GUEST_REFRESH_TOKEN_MARKER
+from ..core.transport import open_upstream
 from ..logging_utils import debug_dump
 
 
@@ -260,7 +261,7 @@ class GLMAccessTokenManager:
         request.headers["X-Device-Id"] = self.get_device_id_for_account(account_index)
         debug_dump(self.logger, self.config.debug_dump_all, f"GLM 刷新 access_token 请求头 account={account_index}", dict(request.header_items()))
         debug_dump(self.logger, self.config.debug_dump_all, f"GLM 刷新 access_token 请求体 account={account_index}", b"{}")
-        with urllib.request.urlopen(request, timeout=self.config.request_timeout) as response:
+        with open_upstream(request, timeout=self.config.request_timeout) as response:
             payload = self.read_json_response(response)
         code = payload.get("code", payload.get("status"))
         result = payload.get("result") or {}
@@ -306,7 +307,7 @@ class GLMAccessTokenManager:
         )
         debug_dump(self.logger, self.config.debug_dump_all, f"GLM 游客 token 请求头 account={account_index}", dict(request.header_items()))
         debug_dump(self.logger, self.config.debug_dump_all, f"GLM 游客 token 请求体 account={account_index}", b"")
-        with urllib.request.urlopen(request, timeout=self.config.request_timeout) as response:
+        with open_upstream(request, timeout=self.config.request_timeout) as response:
             payload = self.read_json_response(response)
         code = payload.get("code", payload.get("status"))
         result = payload.get("result") or {}
