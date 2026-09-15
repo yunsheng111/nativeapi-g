@@ -12,3 +12,23 @@
 """
 
 __version__ = "0.1.0"
+
+
+def _install_device_id_hook() -> None:
+    """D1：把 accounts.json 的真实设备身份接进底座 token 管理器。
+
+    底座 glm2api 不 import glmrelay（依赖不倒挂），钩子在 glmrelay 首次被导入时
+    （server.py 引入 admin 面板扩展时）安装 —— 此刻还没有任何账号槽位被创建。
+    扩展层可选：安装失败不阻断底座启动，账号退回稳定随机设备身份。
+    """
+    try:
+        from glm2api.services.glm_auth import GLMAccessTokenManager
+
+        from .accounts.registry import resolve_device_id
+
+        GLMAccessTokenManager.device_id_resolver = staticmethod(resolve_device_id)
+    except Exception:  # pragma: no cover
+        pass
+
+
+_install_device_id_hook()

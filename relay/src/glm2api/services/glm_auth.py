@@ -11,6 +11,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from logging import Logger
+from typing import Callable
 
 from ..config import AppConfig, GUEST_REFRESH_TOKEN_MARKER
 from ..logging_utils import debug_dump
@@ -18,7 +19,6 @@ from ..logging_utils import debug_dump
 
 SIGN_SECRET = "8a1317a7468aa3ad86e997d08f3f31cb"
 ACCESS_TOKEN_EXPIRES_SECONDS = 3600
-DEVICE_ROTATE_THRESHOLD = 8  # 每个 device_id 最多使用次数，超过后主动轮换
 
 
 def build_sign() -> tuple[str, str, str]:
@@ -49,24 +49,50 @@ class AccountState:
 
 
 class GLMAccessTokenManager:
+    # 扩展点（D1）：glmrelay 在导入时安装，按 refresh_token 返回导入时抓到的
+    # 真实设备标识（chatglm-deid）。底座不感知 accounts.json 的存在。
+    device_id_resolver: Callable[[str], str] | None = None
+
     def __init__(self, config: AppConfig, logger: Logger) -> None:
         self.config = config
         self.logger = logger
-        self._accounts = [
-            AccountState(
-                refresh_token="" if token == GUEST_REFRESH_TOKEN_MARKER else token,
-                is_guest=(token == GUEST_REFRESH_TOKEN_MARKER),
-                device_id=uuid.uuid4().hex,
+        accounts: list[AccountState] = []
+        resolved_devices = 0
+        for token in config.glm_refresh_tokens:
+            is_guest = token == GUEST_REFRESH_TOKEN_MARKER
+            device_id = ""
+            if not is_guest:
+                resolver = type(self).device_id_resolver
+                if resolver is not None:
+                    try:
+                        device_id = resolver(token) or ""
+                    except Exception as exc:
+                        self.logger.warning(
+                            "device_id 解析失败，该账号回退稳定随机值 error=%s", exc
+                        )
+                        device_id = ""
+            if device_id:
+                resolved_devices += 1
+            else:
+                # 真实设备的标识终身不换；拿不到真实值时也用稳定随机值（不轮换）
+                device_id = uuid.uuid4().hex
+            accounts.append(
+                AccountState(
+                    refresh_token="" if is_guest else token,
+                    is_guest=is_guest,
+                    device_id=device_id,
+                )
             )
-            for idx, token in enumerate(config.glm_refresh_tokens)
-        ]
+        self._accounts = accounts
         self._current_index = 0
         self._lock = threading.RLock()  # RLock：因为 next_request_id 会在 _refresh_access_token（已持锁）内被调用
         self._persist_lock = threading.Lock()
         logger.info(
-            "账号管理器初始化 账号数=%s 游客模式=%s",
+            "账号管理器初始化 账号数=%s 游客模式=%s 真实设备身份=%s/%s",
             len(self._accounts),
             any(a.is_guest for a in self._accounts),
+            resolved_devices,
+            len(self._accounts) - sum(1 for a in self._accounts if a.is_guest),
         )
 
     def get_browser_headers(self, app_fr: str = "browser_extension") -> dict[str, str]:
@@ -140,23 +166,13 @@ class GLMAccessTokenManager:
             return uuid.uuid4().hex
 
     def next_request_id_for_account(self, account_index: int) -> str:
-        """生成 request_id，并在达到阈值时主动轮换 device_id。"""
+        """生成 request_id。device_id 一旦确定终身不换（真实设备不会按请求数轮换）；
+        device_request_count 仅作观测统计。失败/冷却时的身份更换走风控冷却分支。"""
         with self._lock:
             if 0 <= account_index < len(self._accounts):
                 acc = self._accounts[account_index]
                 acc.request_id_counter += 1
                 acc.device_request_count += 1
-                # 主动轮换：达到阈值时换新 device_id
-                if acc.device_request_count >= DEVICE_ROTATE_THRESHOLD and acc.device_id:
-                    old_dev = acc.device_id[:8]
-                    acc.device_id = uuid.uuid4().hex
-                    acc.cached_token = None  # 强制重新 fetch token
-                    acc.request_id_counter = 0
-                    acc.device_request_count = 0
-                    self.logger.info(
-                        "account=%s 主动轮换 device_id %s → %s... (达到阈值 %d)",
-                        account_index, old_dev, acc.device_id[:8], DEVICE_ROTATE_THRESHOLD,
-                    )
                 return f"{acc.device_id[:8]}-{int(time.time()*1000)}-{acc.request_id_counter}"
             return f"{uuid.uuid4().hex[:8]}-{int(time.time()*1000)}-1"
 
