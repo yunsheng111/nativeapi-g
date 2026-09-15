@@ -992,8 +992,8 @@ class GLMWebClient:
             executed = False
             for offset in range(account_count):
                 account_index = (start_index + offset) % account_count
-                if self.auth.is_account_cooling_down(account_index):
-                    continue  # 冷却中的账号不硬打上游（风控事件后快速重试等于火上浇油）
+                if not self.auth.is_account_available(account_index):
+                    continue  # 风控冷却 / 熔断摘除中的账号不硬打上游（快速重试等于火上浇油）
                 guest_retry_limit = self.config.glm_guest_max_retries if self.auth.is_guest_account(account_index) else 0
                 lock = self._account_locks[account_index % len(self._account_locks)]
                 if not lock.acquire(blocking=False):
@@ -1002,11 +1002,18 @@ class GLMWebClient:
                     for attempt in range(guest_retry_limit + 1):
                         try:
                             self._apply_request_pacing(account_index)
+                            # 统计口径：一次 attempt = 一次完整上游尝试（含 token 刷新）；
+                            # operation 返回 = 建联成功；流中途的失败属于流层（keepalive/
+                            # 流尾兜底），不计入此处。
+                            self.auth.record_request(account_index)
                             access_token = self.auth.get_access_token_for_account(account_index)
+                            result = operation(account_index, access_token)
+                            self.auth.record_result(account_index, True)
                             executed = True
-                            return operation(account_index, access_token)
+                            return result
                         except Exception as exc:
                             last_exc = exc
+                            self.auth.record_result(account_index, False, str(exc))
                             is_risk = self.auth.classify_risk_event(exc)
                             if is_risk:
                                 self.auth.register_risk_event(account_index, exc)
@@ -1034,13 +1041,13 @@ class GLMWebClient:
                 finally:
                     lock.release()
             if not executed:
-                # 所有账号或在飞（单飞占满）或冷却中：整体等待后重试，
+                # 所有账号或在飞（单飞占满）或冷却/熔断中：整体等待后重试，
                 # 上限复用 busy 重试参数 —— 与"上游忙碌"同一档的耐心。
                 idle_rounds += 1
                 if idle_rounds > self.config.glm_busy_max_retries:
                     raise UpstreamAPIError(
                         status_code=429,
-                        message="GLM 账号全部忙碌或风控冷却中，请稍后重试。",
+                        message="GLM 账号全部忙碌、风控冷却或熔断摘除中，请稍后重试。",
                     )
                 time.sleep(self.config.glm_busy_retry_interval)
                 continue

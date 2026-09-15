@@ -117,6 +117,14 @@ class GLM2APIServer:
         self._server = ThreadingHTTPServer((config.host, config.port), handler_cls)
         self._server.daemon_threads = True
         self._server.allow_reuse_address = True
+        # 扩展层接入区（与模块顶部 try-import 同模式）：账号健康探测随服务启动，
+        # glmrelay 未安装或探测被配置关闭时静默跳过。
+        try:
+            from glmrelay.accounts.health import ensure_health_probe
+
+            ensure_health_probe(config, logger)
+        except Exception as exc:
+            logger.warning("健康探测启动失败（不影响服务） error=%s", exc)
 
     def serve_forever(self) -> None:
         self._server.serve_forever()

@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 from http import HTTPStatus
 
@@ -21,12 +22,19 @@ from glm2api.admin import (
     _write_admin_json,
 )
 from glm2api.config import AppConfig
+from glm2api.services.glm_auth import GLMAccessTokenManager
 
 from .accounts import LoginImportSession, TokenStore, import_from_text
 
 # 导入会话使用的调试端口。与用户日常浏览器的 9222 错开，避免互相抢占。
 LOGIN_DEBUG_PORT = 9333
 PREFIX = "/admin/api/accounts"
+
+
+def _runtime_account_stats() -> list[dict]:
+    """运行时配额视图（P1-b）。auth 未创建（服务启动前）时返回空列表。"""
+    manager = GLMAccessTokenManager.last_instance
+    return manager.get_account_stats() if manager is not None else []
 
 
 def _store_for(config: AppConfig) -> TokenStore:
@@ -96,8 +104,18 @@ def handle_admin_ext(handler, method: str, path: str, config: AppConfig) -> bool
             "accounts": store.list_accounts(),
             "stats": store.stats(),
             "session": session.status() if session else None,
+            "runtime": _runtime_account_stats(),
         }
         _write_admin_json(handler, _api_ok(payload))
+        return True
+
+    # ── POST /admin/api/accounts/probe ───────────────────────────────────
+    if method == "POST" and path == f"{PREFIX}/probe":
+        from .accounts.health import probe_once
+
+        logger = logging.getLogger("glmrelay.admin")
+        probed = probe_once(logger)
+        _write_admin_json(handler, _api_ok({"probed": probed, "runtime": _runtime_account_stats()}))
         return True
 
     # ── POST /admin/api/accounts/import/start ────────────────────────────

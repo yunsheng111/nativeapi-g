@@ -267,6 +267,97 @@ def check_d3(tmp: Path) -> None:
     check(took < 0.05, "S9 抖动=0 时零延迟（可关闭性）", f"{took:.3f}s")
 
 
+# --------------------------------------------------------------- P1-b 配额/熔断/探活
+
+def check_runtime(tmp: Path) -> None:
+    from glm2api.config import load_config
+    from glm2api.services.glm_auth import GLMAccessTokenManager
+
+    logger = logging.getLogger("check_runtime")
+    cfg = load_config(str(tmp / ".env"))
+    mgr = GLMAccessTokenManager(cfg, logger)
+    GLMAccessTokenManager.last_instance = mgr
+
+    # R1 配额统计：请求/成功/失败计数与成功率
+    mgr.record_request(0); mgr.record_result(0, True)
+    mgr.record_request(0); mgr.record_result(0, True)
+    mgr.record_request(0); mgr.record_result(0, False, "boom")
+    row = mgr.get_account_stats()[0]
+    check(
+        row["total_requests"] == 3 and row["total_failures"] == 1 and row["success_rate"] == round(2 / 3, 4),
+        "R1 配额统计：请求数/失败数/成功率",
+        str(row),
+    )
+    check(row["consecutive_failures"] == 1 and row["last_error"] == "boom", "R1-b 失败计数与 last_error")
+
+    # R2 成功重置连续失败
+    mgr.record_result(0, True)
+    check(mgr.get_account_stats()[0]["consecutive_failures"] == 0, "R2 一次成功清零连续失败")
+
+    # R3 连续 3 次失败 → 熔断摘除 + failover 跳过
+    for _ in range(3):
+        mgr.record_request(1); mgr.record_result(1, False, "down")
+    check(mgr.is_account_breaked(1) and not mgr.is_account_cooling_down(1), "R3-a 连续失败 3 次 → 熔断（非风控冷却）")
+    check(not mgr.is_account_available(1), "R3-b 熔断账号对 failover 不可用")
+    check(mgr.get_account_stats()[1]["breaked"] is True, "R3-c stats 视图含 breaked 标记")
+    for i in range(mgr.get_account_count()):
+        mgr._accounts[i].breaker_until = 0.0
+        mgr._accounts[i].cooldown_until = 0.0
+
+    # R4 半开：breaker_until 过期后 failover 恢复使用
+    check(mgr.is_account_available(1), "R4 熔断到期后半开恢复（failover 可重新选它）")
+
+    # R5 探活：缓存命中零上游请求；失败计数与摘除
+    import urllib.request as _ur
+    from glm2api.services.glm_auth import AccessToken
+    from glmrelay.accounts.health import probe_once
+    probe_calls = {"n": 0}
+    real_urlopen = _ur.urlopen
+
+    def counting_urlopen(*a, **kw):
+        probe_calls["n"] += 1
+        raise RuntimeError("network disabled in test")
+
+    _ur.urlopen = counting_urlopen
+    try:
+        # 有效缓存 → 探活零上游请求
+        for i in range(mgr.get_account_count()):
+            mgr._accounts[i].cached_token = AccessToken(access_token="t", refresh_token="r", expires_at=time.time() + 3000)
+            mgr._accounts[i].breaker_until = 0.0
+            mgr._accounts[i].probe_failures = 0
+        n_before = probe_calls["n"]
+        probed = probe_once(logging.getLogger("probe"))
+        check(probe_calls["n"] == n_before, "R5-a 缓存命中账号探活零上游请求", f"{n_before}->{probe_calls['n']}")
+        check(probed == mgr.get_account_count(), "R5-b probe_once 返回探活账号数", f"probed={probed}")
+        # 无缓存 → 探活打上游（mock 失败）；连续 3 轮失败 → 全部熔断摘除
+        for i in range(mgr.get_account_count()):
+            mgr._accounts[i].cached_token = None
+        for _ in range(3):
+            probe_once(logging.getLogger("probe"))
+        stats = mgr.get_account_stats()
+        check(
+            all(s["breaked"] for s in stats) and all("network disabled" in s["last_error"] for s in stats),
+            "R5-c 探活连续失败 3 轮 → 全部熔断摘除且记录 last_error",
+            str([(s["index"], s["breaked"]) for s in stats]),
+        )
+    finally:
+        _ur.urlopen = real_urlopen
+        GLMAccessTokenManager.last_instance = None
+
+    # R6 探活可关闭：GLM_HEALTH_PROBE_SECONDS=0 时不启动线程
+    import threading
+    cfg.glm_health_probe_seconds = 0
+    from glmrelay.accounts.health import ensure_health_probe, _started as _probe_started_flag
+    import glmrelay.accounts.health as health_mod
+    prev_started = health_mod._started
+    try:
+        health_mod._started = False
+        launched = ensure_health_probe(cfg, logging.getLogger("probe"))
+        check(launched is False, "R6 探活间隔=0 时不启动线程")
+    finally:
+        health_mod._started = prev_started
+
+
 def main() -> int:
     os.environ.pop("GLM_TOKEN_FILE", None)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
@@ -286,6 +377,7 @@ def main() -> int:
         check_d4(mgr)
         check_d1(tmp, _deid)
         check_d3(tmp)
+        check_runtime(tmp)
     finally:
         os.chdir(prev_cwd)
         shutil.rmtree(tmp, ignore_errors=True)

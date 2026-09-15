@@ -154,6 +154,7 @@ class AppConfig:
     glm_guest_max_retries: int
     glm_request_jitter_ms: int
     glm_guest_stagger_seconds: float
+    glm_health_probe_seconds: int
     blocked_tool_names: list[str]
     exposed_models: list[str]
     model_aliases: dict[str, str]
@@ -278,6 +279,7 @@ def load_config(env_file: str = ".env") -> AppConfig:
         glm_guest_max_retries=max(0, parse_int(values.get("GLM_GUEST_MAX_RETRIES"), 3)),
         glm_request_jitter_ms=max(0, parse_int(values.get("GLM_REQUEST_JITTER_MS"), 200)),
         glm_guest_stagger_seconds=max(0.0, parse_float(values.get("GLM_GUEST_STAGGER_SECONDS"), 5.0)),
+        glm_health_probe_seconds=max(0, parse_int(values.get("GLM_HEALTH_PROBE_SECONDS"), 300)),
         blocked_tool_names=parse_list(values.get("BLOCKED_TOOL_NAMES"), DEFAULT_BLOCKED_TOOL_NAMES),
         exposed_models=exposed_models,  # type: ignore
         model_aliases=model_aliases,

@@ -249,6 +249,7 @@
           <n-button size="small" type="primary" @click="startImport" :loading="importBusy" :disabled="importRunning">一键登录导入</n-button>
           <n-button size="small" @click="stopImport" :loading="importBusy" :disabled="!importRunning">结束导入</n-button>
           <n-button size="small" @click="fetchAccounts" :loading="accountsLoading">刷新</n-button>
+          <n-button size="small" @click="probeAccounts" :loading="probeBusy">立即探活</n-button>
         </div>
 
         <div v-if="importSession" class="import-status" :class="'is-'+importSession.state">
@@ -271,7 +272,7 @@
         </div>
 
         <table class="data-table" v-if="accounts.length">
-          <thead><tr><th>#</th><th>备注</th><th>Token</th><th>device_id</th><th>来源</th><th>导入时间</th><th></th></tr></thead>
+          <thead><tr><th>#</th><th>备注</th><th>Token</th><th>device_id</th><th>来源</th><th>运行时</th><th>导入时间</th><th></th></tr></thead>
           <tbody>
             <tr v-for="a in accounts" :key="a.fingerprint">
               <td>{{ a.index + 1 }}</td>
@@ -279,6 +280,13 @@
               <td class="mono">{{ a.token_masked }}</td>
               <td class="mono">{{ a.device_id || '—' }}</td>
               <td><span class="badge" :class="a.source==='browser-login'?'badge-info':'badge-warn'">{{ sourceLabel(a.source) }}</span></td>
+              <td>
+                <template v-if="runtimeAt(a.index)">
+                  <span class="badge" :class="runtimeBadgeClass(runtimeAt(a.index))">{{ runtimeLabel(runtimeAt(a.index)) }}</span>
+                  <span class="mono" style="color:var(--muted);margin-left:6px">{{ runtimeAt(a.index).total_requests }} 次 · {{ runtimeSuccessRate(runtimeAt(a.index)) }}</span>
+                </template>
+                <template v-else>—</template>
+              </td>
               <td class="mono">{{ a.imported_at || '—' }}</td>
               <td><n-button size="tiny" quaternary type="error" @click="deleteAccount(a)">删除</n-button></td>
             </tr>
@@ -469,7 +477,37 @@ const app = createApp({
       if (!data) return;
       accounts.value = data.accounts || accounts.value;
       accountStats.value = data.stats || accountStats.value;
+      runtimeStats.value = data.runtime || [];
       if ('session' in data) importSession.value = data.session;
+    }
+
+    // ── 运行时配额（P1-b）──────────────────────────────────────
+    const runtimeStats = ref([]);
+    const probeBusy = ref(false);
+
+    function runtimeAt(index) {
+      return runtimeStats.value.find(r => r.index === index) || null;
+    }
+    function runtimeLabel(r) {
+      if (r.cooling_down) return '风控冷却';
+      if (r.breaked) return '已摘除';
+      if (r.consecutive_failures > 0) return '连续失败 ' + r.consecutive_failures;
+      return '正常';
+    }
+    function runtimeBadgeClass(r) {
+      if (r.cooling_down || r.breaked) return 'badge-warn';
+      if (r.consecutive_failures > 0) return 'badge-warn';
+      return 'badge-info';
+    }
+    function runtimeSuccessRate(r) {
+      if (r.success_rate === null || r.success_rate === undefined) return '未请求';
+      return Math.round(r.success_rate * 100) + '%';
+    }
+    async function probeAccounts() {
+      probeBusy.value = true;
+      try { applyAccounts(await api('/admin/api/accounts/probe', { method: 'POST' })); }
+      catch (e) {}
+      finally { probeBusy.value = false; }
     }
 
     async function fetchAccounts() {
@@ -779,6 +817,7 @@ const app = createApp({
       importBrowser, browserOpts, importRunning, importStateLabel, importBadgeClass,
       pasteText, pasteBusy, pasteResult, fetchAccounts, startImport, stopImport,
       deleteAccount, pasteImport, sourceLabel,
+      runtimeStats, probeBusy, probeAccounts, runtimeAt, runtimeLabel, runtimeBadgeClass, runtimeSuccessRate,
     };
   }
 });
