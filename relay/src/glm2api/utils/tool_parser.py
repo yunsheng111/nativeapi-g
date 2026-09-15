@@ -326,13 +326,26 @@ def _extract_malformed_tool_call_from_root(
     return None
 
 
+# DSML 块解析上限（对齐 glm-web-code 的 1MB 输出安全阀），超限拒绝解析。
+_MAX_DSML_XML_BLOCK = 1_048_576
+
+
 def _parse_xml_block(
     block: str,
     allowed_tool_names: set[str] | None,
     start_index: int,
 ) -> tuple[list[dict[str, object]], tuple[int, int] | None]:
+    # ET 解析器接受内部 DTD 实体展开，而模型输出是半可信输入：
+    # 检测到实体声明或超长块一律按解析失败拒绝，不做剔除后继续。
+    if len(block) > _MAX_DSML_XML_BLOCK:
+        _logger.warning("DSML 块超过 %d 字节，拒绝解析 len=%d", _MAX_DSML_XML_BLOCK, len(block))
+        return [], None
+    normalized = _normalize_dsml_to_xml(block)
+    if "<!DOCTYPE" in normalized or "<!ENTITY" in normalized:
+        _logger.warning("DSML 块含 DOCTYPE/ENTITY 实体声明，拒绝解析 len=%d", len(normalized))
+        return [], None
     try:
-        root = ET.fromstring(_normalize_dsml_to_xml(block))
+        root = ET.fromstring(normalized)
     except ET.ParseError as exc:
         normalized = _normalize_dsml_to_xml(block)
         _logger.debug(

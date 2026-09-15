@@ -103,7 +103,6 @@ ERROR_UPSTREAM = "upstream_error"
 
 # Common error codes
 CODE_MODEL_NOT_FOUND = "model_not_found"
-CODE_INVALID_API_KEY = "invalid_api_key"
 CODE_RATE_LIMIT_EXCEEDED = "rate_limit_exceeded"
 
 
