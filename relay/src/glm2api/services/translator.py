@@ -352,6 +352,7 @@ def convert_messages(
     blocked_tool_names: set[str] | None = None,
     tool_choice: object | None = None,
     server_side_tool_names: set[str] | None = None,
+    tool_result_max_chars: int | None = None,
 ) -> list[dict[str, object]]:
     tools = filter_tools(tools, blocked_tool_names or set())
     available_tool_names = {
@@ -423,6 +424,7 @@ def convert_messages(
                 tool_call_id=tool_call_id or message.get("tool_call_id", "unknown"),
                 tool_name=tool_name,
                 content=tool_result_text,
+                max_chars=tool_result_max_chars,
             )
         elif role == "assistant" and not content:
             continue

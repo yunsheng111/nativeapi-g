@@ -422,6 +422,61 @@ def check_p2(tmp: Path) -> None:
     flat7 = json.dumps(converted7, ensure_ascii=False)
     check("孤儿结果" in flat7, "B7 无前文时 tool 结果短路通过")
 
+    # ── C 组：工具结果体积治理（7.5.2）+ 不可信输入包裹（7.5.4）──
+    from glm2api.utils.tool_protocol import (
+        TOOL_RESULT_END_MARKER,
+        TOOL_RESULT_TRUST_NOTICE,
+        serialize_tool_result_block,
+        truncate_tool_result,
+    )
+
+    # C1 声明壳：信任声明前缀 + 结束标记
+    normal = serialize_tool_result_block("call_1", "fetch", "正常长度结果")
+    check(
+        normal.startswith(TOOL_RESULT_TRUST_NOTICE) and normal.endswith(TOOL_RESULT_END_MARKER),
+        "C1 工具结果带信任声明前缀与结束标记",
+    )
+
+    # C2 正常长度不截断
+    check("正常长度结果" in normal and "已截断" not in normal, "C2 未超限内容原样保留")
+
+    # C3 超长截断：保留首尾、注明原始长度、总长受控
+    big = "A" * 5000 + "MIDDLE" + "B" * 5000
+    truncated = serialize_tool_result_block("call_2", "fetch", big, max_chars=1000)
+    check(
+        "原始 10006 字符" in truncated and truncated.startswith(TOOL_RESULT_TRUST_NOTICE),
+        "C3-a 超长结果截断并注明原始长度",
+    )
+    check("A" in truncated and "B" in truncated and "MIDDLE" not in truncated, "C3-b 保留首尾丢弃中段")
+    body_len = truncated.index(TOOL_RESULT_END_MARKER) - truncated.index("<|DSML|tool_result")
+    check(
+        body_len < 2000,
+        "C3-c 截断后结果块长度受控",
+        f"body≈{body_len}",
+    )
+
+    # C4 关闭开关：max_chars=0 不截断
+    unbounded = serialize_tool_result_block("call_3", "fetch", big, max_chars=0)
+    check("MIDDLE" in unbounded and "已截断" not in unbounded, "C4 max_chars=0 时不截断（可关闭性）")
+
+    # C5 CDATA 转义在截断前后都工作
+    cdata_break = serialize_tool_result_block("call_4", "t", "x]]>y", max_chars=None)
+    check("]]]]><![CDATA[>" in cdata_break, "C5 CDATA 闭合序列转义仍工作")
+
+    # C6 端到端：convert_messages 传 max_chars → 拍平消息含截断标记
+    msgs_big = [
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "call_big", "type": "function", "function": {"name": "fetch", "arguments": "{}"}}
+        ]},
+        {"role": "tool", "tool_call_id": "call_big", "content": big},
+    ]
+    converted_c = convert_messages(msgs_big, None, tool_result_max_chars=1000)
+    flat_c = json.dumps(converted_c, ensure_ascii=False)
+    check(
+        "原始 10006 字符" in flat_c and TOOL_RESULT_TRUST_NOTICE[:12] in flat_c,
+        "C6 端到端：截断与信任声明进入拍平消息",
+    )
+
 
 def main() -> int:
     os.environ.pop("GLM_TOKEN_FILE", None)
