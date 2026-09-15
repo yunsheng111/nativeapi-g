@@ -308,17 +308,19 @@ def check_runtime(tmp: Path) -> None:
     check(mgr.is_account_available(1), "R4 熔断到期后半开恢复（failover 可重新选它）")
 
     # R5 探活：缓存命中零上游请求；失败计数与摘除
-    import urllib.request as _ur
+    # mock 必须走 seam 注入 —— transport 的 _open 在 import 时绑定 urlopen 引用，
+    # patch urllib.request.urlopen 拦不到 seam 调用（探活会真实打到上游）。
+    from glm2api.core import transport
     from glm2api.services.glm_auth import AccessToken
     from glmrelay.accounts.health import probe_once
     probe_calls = {"n": 0}
-    real_urlopen = _ur.urlopen
+    real_urlopen = transport._open
 
-    def counting_urlopen(*a, **kw):
+    def counting_opener(request, timeout=None):
         probe_calls["n"] += 1
         raise RuntimeError("network disabled in test")
 
-    _ur.urlopen = counting_urlopen
+    transport.set_upstream_transport(counting_opener)
     try:
         # 有效缓存 → 探活零上游请求
         for i in range(mgr.get_account_count()):
@@ -341,7 +343,7 @@ def check_runtime(tmp: Path) -> None:
             str([(s["index"], s["breaked"]) for s in stats]),
         )
     finally:
-        _ur.urlopen = real_urlopen
+        transport.set_upstream_transport(None)
         GLMAccessTokenManager.last_instance = None
 
     # R6 探活可关闭：GLM_HEALTH_PROBE_SECONDS=0 时不启动线程
@@ -356,6 +358,69 @@ def check_runtime(tmp: Path) -> None:
         check(launched is False, "R6 探活间隔=0 时不启动线程")
     finally:
         health_mod._started = prev_started
+
+
+# --------------------------------------------------------------- P2 工具契约
+
+def check_p2(tmp: Path) -> None:
+    from glm2api.services.translator import convert_messages
+    from glm2api.utils.tool_parser import _is_allowed_tool_name
+
+    # B1 客户端声明的撞名工具放行（7.3：黑名单改为按名字 + 来源匹配）
+    check(
+        _is_allowed_tool_name("web_search", {"web_search"}) is True,
+        "B1 客户端声明的 web_search → 解析放行",
+    )
+    check(
+        _is_allowed_tool_name("web_search", {"other_tool"}) is False,
+        "B2 客户端未声明 → 上游原生名单仍拒（防模型幻觉）",
+    )
+    check(
+        _is_allowed_tool_name("get_weather", None) is True,
+        "B3 无声明约束时普通工具名放行",
+    )
+
+    # B4 注入过滤：撞名工具不再被 NATIVE 名单剔除（仅 env 黑名单生效）
+    from glm2api.utils.tool_protocol import filter_tools
+
+    tools = [{"type": "function", "function": {"name": "web_search", "parameters": {}}}]
+    kept = filter_tools(tools, set())  # NATIVE 名单不再传入
+    check(kept is not None and len(kept) == 1, "B4 撞名客户端工具不再被注入过滤剔除")
+    kept2 = filter_tools(tools, {"web_search"})
+    check(kept2 is None, "B4-b 环境变量黑名单仍无条件剔除")
+
+    # B5 tool_call_id 不匹配 → 显式 ValueError（400 invalid_request）
+    msgs_mismatch = [
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "call_abc", "type": "function", "function": {"name": "t", "arguments": "{}"}}
+        ]},
+        {"role": "tool", "tool_call_id": "call_XXX", "content": "结果"},
+    ]
+    raised = None
+    try:
+        convert_messages(msgs_mismatch, None)
+    except ValueError as exc:
+        raised = exc
+    check(raised is not None and "tool_call_id" in str(raised), "B5 id 不匹配 → 显式报错（不再静默丢弃）", str(raised))
+
+    # B6 repaired id 的结果照常回灌（不再静默丢失）
+    msgs_repaired = [
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "call_repaired_1", "type": "function", "function": {"name": "t", "arguments": "{}"}, "_repaired": True}
+        ]},
+        {"role": "tool", "tool_call_id": "call_repaired_1", "content": "修复路径结果"},
+    ]
+    try:
+        converted = convert_messages(msgs_repaired, None)
+        flat = json.dumps(converted, ensure_ascii=False)
+        check("修复路径结果" in flat, "B6 repaired id 结果回灌不丢失")
+    except ValueError as exc:
+        check(False, "B6 repaired id 结果回灌不丢失", f"误报错: {exc}")
+
+    # B7 仅发 tool 结果（无 assistant tool_calls 前文）→ 短路通过（兼容保留）
+    converted7 = convert_messages([{"role": "tool", "tool_call_id": "call_orphan", "content": "孤儿结果"}], None)
+    flat7 = json.dumps(converted7, ensure_ascii=False)
+    check("孤儿结果" in flat7, "B7 无前文时 tool 结果短路通过")
 
 
 def main() -> int:
@@ -378,6 +443,7 @@ def main() -> int:
         check_d1(tmp, _deid)
         check_d3(tmp)
         check_runtime(tmp)
+        check_p2(tmp)
     finally:
         os.chdir(prev_cwd)
         shutil.rmtree(tmp, ignore_errors=True)

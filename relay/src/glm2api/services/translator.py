@@ -404,10 +404,18 @@ def convert_messages(
             content = f"{assistant_text}\n{block}".strip() if assistant_text and block else (assistant_text or block)
         elif role == "tool":
             tool_call_id = str(message.get("tool_call_id", "")).strip()
-            if tool_call_id and valid_tool_call_ids and tool_call_id not in valid_tool_call_ids:
-                continue
-            if tool_call_id and tool_call_id in repaired_tool_call_ids:
-                continue
+            # P2 改造（7.5.3）：id 对齐失败从静默丢弃改为显式报错 —— 静默丢弃会让
+            # 工具结果凭空消失、模型只能编答案（违反"失败不可伪装成成功"）。
+            # 仅当本轮存在 assistant tool_calls（valid_tool_call_ids 非空）才校验；
+            # 中转修复过的 id（call_repaired_*，模型原输出缺 id）由客户端原样回传，
+            # 与正常结果在模型视角对称（call 块本就不带 id），照常回灌不校验。
+            if tool_call_id and tool_call_id not in repaired_tool_call_ids:
+                if valid_tool_call_ids and tool_call_id not in valid_tool_call_ids:
+                    raise ValueError(
+                        f"tool_call_id 与本轮 assistant tool_calls 不匹配: {tool_call_id!r}。"
+                        "请原样回传中转下发的 tool_call id（客户端不得自行重编号），"
+                        "或不要附带带 tool_calls 的 assistant 历史消息。"
+                    )
             role = "user"
             tool_name = str(message.get("name", "")).strip() or "unknown_tool"
             tool_result_text = extract_text_content(content)

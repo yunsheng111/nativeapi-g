@@ -140,8 +140,13 @@ def _normalize_dsml_to_xml(block: str) -> str:
 
 
 def _is_allowed_tool_name(tool_name: str, allowed_tool_names: set[str] | None) -> bool:
+    # 客户端显式声明的工具优先（P2 改造 7.3）：即使名字与上游原生工具撞名
+    # （如 web_search 是很多客户端的默认名），只要客户端真的声明了它，就放行 ——
+    # 客户端自己执行工具，中转无权单方面撕毁 tools 契约。
+    if allowed_tool_names is not None and tool_name in allowed_tool_names:
+        return True
     if tool_name in BLOCKED_NATIVE_TOOL_NAMES:
-        return False
+        return False  # 模型自行发明的上游原生工具名：物理上拿不到，一律拒绝
     return allowed_tool_names is None or tool_name in allowed_tool_names
 
 

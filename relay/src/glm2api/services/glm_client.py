@@ -26,7 +26,6 @@ from ..core.transport import open_upstream
 from ..logging_utils import debug_dump
 from .glm_auth import GLMAccessTokenManager, build_sign
 from .translator import (
-    BLOCKED_NATIVE_TOOL_NAMES,
     GLMEventAccumulator,
     SERVER_SIDE_TOOL_NAMES,
     convert_messages,
@@ -145,11 +144,15 @@ class GLMWebClient:
 
     def _resolve_tools(self, openai_payload: dict[str, object]) -> tuple[list[dict[str, object]] | None, set[str] | None]:
         raw_tools = list(openai_payload.get("tools", [])) if isinstance(openai_payload.get("tools"), list) else None # type: ignore
+        # P2 改造（7.3）：注入过滤只应用环境变量黑名单（部署者主动屏蔽）。
+        # BLOCKED_NATIVE_TOOL_NAMES 不再参与此处 —— 客户端声明的工具即便与上游
+        # 原生工具撞名（如 web_search）也应注入给模型；对"模型自行发明"的原生
+        # 工具名，防幻觉防线保留在 tool_parser._is_allowed_tool_name（解析输出时）。
         blocked_tool_names = {
             name.strip()
             for name in self.config.blocked_tool_names
             if name.strip()
-        } | BLOCKED_NATIVE_TOOL_NAMES
+        }
         filtered_tools = filter_tools(raw_tools, blocked_tool_names)
         if raw_tools and len(raw_tools) != len(filtered_tools or []):
             blocked_names: list[str] = []
