@@ -156,6 +156,13 @@ class AppConfig:
     glm_guest_stagger_seconds: float
     glm_health_probe_seconds: int
     glm_transport_block_private: bool
+    glm_transport: str
+    glm_cdp_headless: bool
+    glm_cdp_port: int
+    glm_cdp_user_data_dir: str
+    glm_cdp_origin: str
+    glm_cdp_breaker_threshold: int
+    glm_cdp_breaker_seconds: float
     glm_tool_result_max_chars: int
     blocked_tool_names: list[str]
     exposed_models: list[str]
@@ -283,6 +290,13 @@ def load_config(env_file: str = ".env") -> AppConfig:
         glm_guest_stagger_seconds=max(0.0, parse_float(values.get("GLM_GUEST_STAGGER_SECONDS"), 5.0)),
         glm_health_probe_seconds=max(0, parse_int(values.get("GLM_HEALTH_PROBE_SECONDS"), 300)),
         glm_transport_block_private=parse_bool(values.get("GLM_TRANSPORT_BLOCK_PRIVATE"), True),
+        glm_transport=(lambda v: v if v in ("urllib", "cdp") else "urllib")(values.get("GLM_TRANSPORT", "urllib").strip().lower()),
+        glm_cdp_headless=parse_bool(values.get("GLM_CDP_HEADLESS"), False),
+        glm_cdp_port=max(0, parse_int(values.get("GLM_CDP_PORT"), 0)),
+        glm_cdp_user_data_dir=values.get("GLM_CDP_USER_DATA_DIR", "").strip() or "_cdp_profile",
+        glm_cdp_origin=values.get("GLM_CDP_ORIGIN", "https://chatglm.cn").strip() or "https://chatglm.cn",
+        glm_cdp_breaker_threshold=max(1, parse_int(values.get("GLM_CDP_BREAKER_THRESHOLD"), 3)),
+        glm_cdp_breaker_seconds=max(1.0, parse_float(values.get("GLM_CDP_BREAKER_SECONDS"), 600.0)),
         glm_tool_result_max_chars=max(0, parse_int(values.get("GLM_TOOL_RESULT_MAX_CHARS"), 24000)),
         blocked_tool_names=parse_list(values.get("BLOCKED_TOOL_NAMES"), DEFAULT_BLOCKED_TOOL_NAMES),
         exposed_models=exposed_models,  # type: ignore

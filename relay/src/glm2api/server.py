@@ -13,6 +13,8 @@ from urllib.parse import urlparse
 
 from .config import AppConfig
 from .logging_utils import debug_dump
+from .core.transport import set_request_transport
+from .model_variants import model_requests_cdp
 from .admin import (
     ApiKeyStore,
     RequestLogStore,
@@ -125,6 +127,14 @@ class GLM2APIServer:
             ensure_health_probe(config, logger)
         except Exception as exc:
             logger.warning("健康探测启动失败（不影响服务） error=%s", exc)
+        # P2.5：CDP 同源 fetch 传输路由（GLM_TRANSPORT / -cdp 后缀 / X-GLM2API-Transport）。
+        # 装配失败或 glmrelay 缺失时保持默认 urllib 传输，不影响服务。
+        try:
+            from glmrelay.browser.cdp_fetch import install_transport_route
+
+            install_transport_route(config, logger)
+        except Exception as exc:
+            logger.warning("CDP 传输路由装配失败（继续使用 urllib 传输） error=%s", exc)
 
     def serve_forever(self) -> None:
         self._server.serve_forever()
@@ -232,6 +242,8 @@ class GLM2APIServer:
             def do_POST(self) -> None:
                 _start = time.time()
                 path = self._path_without_query()
+                # 传输提示按请求覆盖设置；开头先清，防线程复用残留上一请求的值
+                set_request_transport(None)
                 try:
                     self._debug_log_request_start()
                     # ── glmrelay 扩展：账号池 / 登录导入 ────────────────
@@ -326,6 +338,12 @@ class GLM2APIServer:
                         )
                         return
                     debug_dump(logger, config.debug_dump_all, f"HTTP 入站解析后 JSON path={self.path}", payload)
+
+                    # P2.5 传输路由：请求头 > 模型后缀 > 全局 GLM_TRANSPORT（routed opener 内裁决）
+                    hint = (self.headers.get("X-GLM2API-Transport") or "").strip().lower()
+                    if hint not in ("cdp", "urllib"):
+                        hint = "cdp" if model_requests_cdp(str(payload.get("model") or "")) else None
+                    set_request_transport(hint)
 
                     # --- Anthropic Messages API ---
                     if path == f"{config.api_prefix}/messages":

@@ -299,6 +299,38 @@ class CDPClient:
 
     # -- 便捷方法
 
+    def pump_events(self, callback, on_close=None) -> None:
+        """阻塞循环分发 CDP 事件，供独立线程做流式泵。
+
+        本连接约定只收不调（call 由主连接负责），因此循环里忽略一切
+        call 响应，仅向 callback 投递 method 事件；连接断开时回调
+        on_close 后返回（WebSocketError 视为正常断连，其他异常同样终止）。
+        """
+        ws = self._ws
+        if ws is None:
+            raise CDPError("CDP 会话未连接")
+        try:
+            while True:
+                message = ws.recv_text()
+                if message is None:
+                    break
+                try:
+                    obj = json.loads(message)
+                except json.JSONDecodeError:
+                    continue
+                if "id" not in obj and obj.get("method"):
+                    callback(obj)
+        except (WebSocketError, OSError, TimeoutError):
+            # WebSocketError = 协议层断连；OSError（含 WinError 10038 socket 已关）
+            # 与 TimeoutError = stop() 关闭连接时泵线程正在 recv，均视作正常断连。
+            pass
+        finally:
+            if on_close is not None:
+                try:
+                    on_close()
+                except Exception:  # noqa: BLE001
+                    pass
+
     def evaluate(
         self,
         expression: str,

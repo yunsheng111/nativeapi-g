@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 
-MODEL_FEATURE_SUFFIXES = ("think", "search")
+MODEL_FEATURE_SUFFIXES = ("cdp", "think", "search")
 MODEL_VARIANT_SUFFIXES = (
     ("think",),
     ("search",),
@@ -39,6 +39,12 @@ def expand_model_variants(models: list[str] | tuple[str, ...], excluded_models: 
 def model_requests_thinking(model: str) -> bool:
     _, features = split_model_features(model)
     return "think" in features
+
+
+def model_requests_cdp(model: str) -> bool:
+    """模型名 -cdp 后缀：该请求经 CDP 同源 fetch 传输发出（P2.5）。"""
+    _, features = split_model_features(model)
+    return "cdp" in features
 
 
 def model_requests_search(model: str) -> bool:

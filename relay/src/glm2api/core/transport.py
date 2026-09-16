@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import ipaddress
 import socket
+import threading
 import urllib.request
 from typing import Callable
 from urllib.parse import urlsplit
@@ -22,6 +23,10 @@ from urllib.parse import urlsplit
 _open: Callable[..., object] = urllib.request.urlopen
 _DEFAULT_OPEN: Callable[..., object] = _open
 _block_private: bool = True
+
+# 请求级传输提示（P2.5）：每请求一线程，由 server 层解析 X-GLM2API-Transport
+# 头与模型后缀后设置，routed opener 读取；优先级高于全局 GLM_TRANSPORT。
+_hint = threading.local()
 
 # RFC 2544 benchmark 段（198.18.0.0/15）：TUN 代理的 fake-IP 模式用它承载到公网的
 # 连接，不指向任何真实内网服务 —— 从私网阻断中例外，否则代理环境下正常请求被打死。
@@ -69,3 +74,13 @@ def set_upstream_policy(block_private: bool | None = None) -> None:
     global _block_private
     if block_private is not None:
         _block_private = block_private
+
+
+def set_request_transport(name: str | None) -> None:
+    """设置当前线程的传输提示（"cdp" / "urllib" / None=清除）。"""
+    _hint.name = name
+
+
+def current_request_transport() -> str | None:
+    name = getattr(_hint, "name", None)
+    return name if name in ("cdp", "urllib") else None
