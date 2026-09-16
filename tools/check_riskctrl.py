@@ -1048,6 +1048,67 @@ def check_p07(tmp: Path) -> None:
     check(mgr3.is_account_breaked(0), "GR4 grace=0 连续 3 败立即摘除（可关闭性）")
 
 
+# --------------------------------------------------------------- P2.6 P0-8 全局最小间隔节流
+
+def check_p08(tmp: Path) -> None:
+    from glm2api.config import load_config
+    from glm2api.services.glm_client import GLMWebClient, GlobalRequestPacer
+
+    # PT1 节流器单元：min_interval=200ms → 到达间隔 ≥200ms
+    pacer = GlobalRequestPacer()
+    fires: list[float] = []
+    for _ in range(6):
+        wait_for = pacer.wait(200.0)
+        if wait_for > 0:
+            time.sleep(wait_for)
+        fires.append(time.monotonic())
+    gaps = [b - a for a, b in zip(fires, fires[1:])]
+    check(all(g >= 0.19 for g in gaps), "PT1 串行 6 次分配到达间隔 ≥200ms", f"gaps={[round(g, 3) for g in gaps]}")
+
+    # PT2 =0 关闭 → 零等待
+    pacer0 = GlobalRequestPacer()
+    t0 = time.monotonic()
+    for _ in range(5):
+        pacer0.wait(0)
+    check(time.monotonic() - t0 < 0.05, "PT2 min_interval=0 零等待（可关闭性）")
+
+    # PT3 并发线程全部经 _apply_request_pacing → 到达间隔仍 ≥200ms（补 6 线程同时醒来的漏洞）
+    logger = logging.getLogger("check_p08")
+    cfg = load_config(str(tmp / ".env"))
+    cfg.glm_request_jitter_ms = 0
+    cfg.glm_guest_stagger_seconds = 0
+    cfg.glm_min_request_interval_ms = 200
+    client = GLMWebClient(cfg, logger)
+    arrivals: list[float] = []
+    lock = threading.Lock()
+
+    def worker() -> None:
+        client._apply_request_pacing(0)
+        with lock:
+            arrivals.append(time.monotonic())
+
+    threads = [threading.Thread(target=worker) for _ in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    arrivals.sort()
+    gaps3 = [b - a for a, b in zip(arrivals, arrivals[1:])]
+    # 容差 0.17s：Windows 时钟粒度 ~15.6ms，落表测量有 ±1 tick 噪声；
+    # slot 数学本身保证 ≥ interval（见 GlobalRequestPacer.wait）
+    check(
+        len(arrivals) == 6 and all(g >= 0.17 for g in gaps3),
+        "PT3 6 并发 pacing 后到达间隔 ≥200ms（±时钟粒度容差）",
+        f"gaps={[round(g, 3) for g in gaps3]}",
+    )
+
+    # PT4 关闭后 pacing 零延迟（旧行为保持）
+    cfg.glm_min_request_interval_ms = 0
+    t0 = time.monotonic()
+    client._apply_request_pacing(0)
+    check(time.monotonic() - t0 < 0.05, "PT4 min_interval=0 时 pacing 零延迟")
+
+
 def main() -> int:
     os.environ.pop("GLM_TOKEN_FILE", None)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
@@ -1074,6 +1135,7 @@ def main() -> int:
         check_p05(tmp)
         check_p06(tmp)
         check_p07(tmp)
+        check_p08(tmp)
         check_runtime(tmp)
         check_p2(tmp)
         check_p6(tmp)

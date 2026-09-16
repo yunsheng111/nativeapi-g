@@ -71,6 +71,31 @@ class QueueTimeoutError(RuntimeError):
     pass
 
 
+class GlobalRequestPacer:
+    """P0-8 全局最小间隔节流器：单调时钟 + slot 分配"下一请求时刻"。
+
+    补并发闸门的抖动漏洞 —— GLM_MAX_CONCURRENCY 只限同时在飞数，6 个线程
+    仍可能同一瞬间醒来打上游。本节流器让所有请求的上游到达时刻彼此间隔
+    ≥ min_interval（slot 间额外加少量随机抖动摊平节奏），多线程共享一把锁。
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._next_slot = 0.0
+
+    def wait(self, min_interval_ms: float) -> float:
+        """分配一个不早于上一 slot + min_interval 的发起时刻，返回需等待的秒数。"""
+        if min_interval_ms <= 0:
+            return 0.0
+        interval = min_interval_ms / 1000.0
+        now = time.monotonic()
+        with self._lock:
+            slot = max(self._next_slot, now) + random.uniform(0, interval * 0.25)
+            wait_for = max(0.0, slot - now)
+            self._next_slot = slot + interval
+        return wait_for
+
+
 @dataclass(slots=True)
 class QueueLease:
     ticket: int
@@ -149,6 +174,8 @@ class GLMWebClient:
             wait_timeout=config.glm_queue_wait_timeout,
             max_concurrency=config.glm_max_concurrency,
         )
+        # P0-8 全局最小间隔节流器（默认 0 = 关闭，行为与旧版一致）
+        self._request_pacer = GlobalRequestPacer()
 
     def _resolve_tools(self, openai_payload: dict[str, object]) -> tuple[list[dict[str, object]] | None, set[str] | None]:
         raw_tools = list(openai_payload.get("tools", [])) if isinstance(openai_payload.get("tools"), list) else None # type: ignore
@@ -1020,12 +1047,16 @@ class GLMWebClient:
         return ticket % account_count
 
     def _apply_request_pacing(self, account_index: int) -> None:
-        """请求发起前的节奏控制（D3）：随机抖动 + 游客槽错峰。只影响发起时刻，
-        不影响流内 keepalive（_iter_sse_events 的空闲计时从首个响应字节才开始）。"""
+        """请求发起前的节奏控制（D3）：随机抖动 + 游客槽错峰 + 全局最小间隔（P0-8）。
+        只影响发起时刻，不影响流内 keepalive（_iter_sse_events 的空闲计时从首个
+        响应字节才开始）。"""
         jitter_ms = self.config.glm_request_jitter_ms
         if jitter_ms > 0:
             time.sleep(random.uniform(0, jitter_ms) / 1000.0)
         self.auth.apply_guest_stagger(account_index)
+        wait_for = self._request_pacer.wait(self.config.glm_min_request_interval_ms)
+        if wait_for > 0:
+            time.sleep(wait_for)
 
     def _call_with_account_failover(
         self,

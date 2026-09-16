@@ -167,6 +167,7 @@ class AppConfig:
     glm_context_max_tokens: int
     glm_stream_max_seconds: int
     glm_account_grace_seconds: int
+    glm_min_request_interval_ms: int
     blocked_tool_names: list[str]
     exposed_models: list[str]
     model_aliases: dict[str, str]
@@ -307,6 +308,8 @@ def load_config(env_file: str = ".env") -> AppConfig:
         glm_stream_max_seconds=max(0, parse_int(values.get("GLM_STREAM_MAX_SECONDS"), 600)),
         # P0-7 新账号失败宽限：进入账号池后 N 秒内失败不计入通用熔断（风控不豁免），0 = 关闭
         glm_account_grace_seconds=max(0, parse_int(values.get("GLM_ACCOUNT_GRACE_SECONDS"), 600)),
+        # P0-8 全局最小间隔节流：相邻请求的上游到达时刻最小间隔（毫秒），0 = 关闭
+        glm_min_request_interval_ms=max(0, parse_int(values.get("GLM_MIN_REQUEST_INTERVAL_MS"), 0)),
         blocked_tool_names=parse_list(values.get("BLOCKED_TOOL_NAMES"), DEFAULT_BLOCKED_TOOL_NAMES),
         exposed_models=exposed_models,  # type: ignore
         model_aliases=model_aliases,
