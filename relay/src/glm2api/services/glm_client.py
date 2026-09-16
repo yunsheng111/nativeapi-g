@@ -780,6 +780,34 @@ class GLMWebClient:
             except OSError:
                 pass
 
+        # P0-6 SSE 硬超时看门狗：单条流超过 GLM_STREAM_MAX_SECONDS 即强制关流，
+        # 解除阻塞读（对照 chatgpt2api 单流挂 29.5 分钟事故）。shutdown 底层
+        # socket 确保阻塞中的 recv 在 Windows 上也能被唤醒。
+        watchdog = None
+        stream_started_at = time.monotonic()
+        max_stream_seconds = int(self.config.glm_stream_max_seconds or 0)
+        if max_stream_seconds > 0:
+            def _force_close_stream() -> None:
+                elapsed = time.monotonic() - stream_started_at
+                self.logger.warning(
+                    "上游 SSE 超过硬超时上限 %ss（实际存活 %.0fs），看门狗强制关流并按已收内容收尾",
+                    max_stream_seconds,
+                    elapsed,
+                )
+                try:
+                    if sock is not None and hasattr(sock, "shutdown"):
+                        sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                try:
+                    response.close()
+                except Exception:
+                    pass
+
+            watchdog = threading.Timer(max_stream_seconds, _force_close_stream)
+            watchdog.daemon = True
+            watchdog.start()
+
         try:
             while True:
                 stop_after_chunk = False
@@ -793,6 +821,10 @@ class GLMWebClient:
                     raw_chunk = exc.partial or b""
                     stop_after_chunk = True
                     self.logger.warning("上游 SSE 连接提前断开，按已接收内容收尾 bytes=%s", len(raw_chunk))
+                except (OSError, ValueError) as exc:
+                    # 看门狗强制关流 / 传输层中断：对齐 IncompleteRead 的收尾语义
+                    self.logger.warning("上游 SSE 读取中断，按已接收内容收尾 error=%s", exc)
+                    break
                 if not raw_chunk:
                     break
 
@@ -809,6 +841,8 @@ class GLMWebClient:
                 if stop_after_chunk:
                     break
         finally:
+            if watchdog is not None:
+                watchdog.cancel()
             # Restore original socket timeout
             if sock is not None and hasattr(sock, "settimeout") and original_timeout is not None:
                 sock.settimeout(original_timeout)

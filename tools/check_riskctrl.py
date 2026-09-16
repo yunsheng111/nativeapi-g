@@ -912,6 +912,87 @@ def check_p05(tmp: Path) -> None:
     )
 
 
+# --------------------------------------------------------------- P2.6 P0-6 SSE 硬超时看门狗
+
+def check_p06(tmp: Path) -> None:
+    from glm2api.config import load_config
+    from glm2api.services.glm_client import GLMWebClient
+
+    logger = logging.getLogger("check_p06")
+    logs = LogCapture()
+    logger.addHandler(logs)
+
+    cfg = load_config(str(tmp / ".env"))
+    cfg.glm_stream_max_seconds = 1
+    client = GLMWebClient(cfg, logger)
+
+    class HangingResponse:
+        """read 阻塞直到被外部 close 的假响应（模拟挂死的上游流）。"""
+
+        def __init__(self) -> None:
+            self.closed = False
+
+        def read(self, size: int = -1) -> bytes:
+            deadline = time.time() + 5
+            while time.time() < deadline and not self.closed:
+                time.sleep(0.02)
+            if self.closed:
+                raise ValueError("I/O operation on closed file.")
+            return b""
+
+        def close(self) -> None:
+            self.closed = True
+
+    # WD1 挂死流 → 看门狗到点强制关流，迭代器在时限内收尾并留痕
+    resp = HangingResponse()
+    t0 = time.monotonic()
+    events = list(client._iter_sse_events(resp))
+    elapsed = time.monotonic() - t0
+    check(elapsed < 3.0, "WD1-a 看门狗解除阻塞读（<3s 内收尾，mock 上限 5s）", f"elapsed={elapsed:.2f}s")
+    check(resp.closed, "WD1-b 看门狗确实关闭了响应")
+    check(any("看门狗" in m for m in logs.messages), "WD1-c 强制关流显式留痕（失败不静默）", f"logs={logs.messages[:2]}")
+    check(events == [], "WD1-d 挂死流无事件产出")
+
+    # WD2 看门狗可关闭：max_seconds=0 时不强制干预
+    logs.messages.clear()
+    cfg.glm_stream_max_seconds = 0
+
+    class OneShotResponse:
+        def __init__(self) -> None:
+            self.sent = False
+            self.closed = False
+
+        def read(self, size: int = -1) -> bytes:
+            if not self.sent:
+                self.sent = True
+                return b"data: {\"ping\": 1}\n\n"
+            return b""
+
+        def close(self) -> None:
+            self.closed = True
+
+    resp2 = OneShotResponse()
+    t0 = time.monotonic()
+    events2 = list(client._iter_sse_events(resp2))
+    elapsed2 = time.monotonic() - t0
+    check(elapsed2 < 1.0 and events2 == [{"ping": 1}], "WD2 关闭看门狗后正常流不受影响", f"events={events2} {elapsed2:.2f}s")
+    check(not any("看门狗" in m for m in logs.messages), "WD2-b 关闭时不触发看门狗")
+
+    # WD3 正常流完整体：两帧数据 + EOF
+    class TwoFrameResponse:
+        def __init__(self) -> None:
+            self.frames = [b"data: {\"n\": 1}\n\n", b"data: {\"n\": 2}\n\n", b""]
+
+        def read(self, size: int = -1) -> bytes:
+            return self.frames.pop(0) if self.frames else b""
+
+        def close(self) -> None:
+            pass
+
+    events3 = list(client._iter_sse_events(TwoFrameResponse()))
+    check(events3 == [{"n": 1}, {"n": 2}], "WD3 正常两帧流完整解析", str(events3))
+
+
 def main() -> int:
     os.environ.pop("GLM_TOKEN_FILE", None)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
@@ -936,6 +1017,7 @@ def main() -> int:
         check_p03(tmp)
         check_p04(tmp)
         check_p05(tmp)
+        check_p06(tmp)
         check_runtime(tmp)
         check_p2(tmp)
         check_p6(tmp)
