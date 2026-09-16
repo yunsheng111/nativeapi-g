@@ -23,3 +23,6 @@ artifacts/
 # P2.5 CDP 传输浏览器 profile（本地登录态，绝不入库）
 relay/_cdp_profile/
 relay/_cdp_profile_*/
+
+# 会话工具本地记忆目录
+.workbuddy-ai/
