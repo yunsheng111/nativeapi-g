@@ -367,7 +367,20 @@ def convert_messages(
     latest_user_url: str | None = extract_recent_user_url(messages)
     valid_tool_call_ids: set[str] = set()
     repaired_tool_call_ids: set[str] = set()
-    for message in messages:
+    # P0-3 去累积：信任声明壳只加在"当轮"工具结果上 —— 从尾部反向扫描，得到
+    # 尚未被 assistant 回应的工具结果连续段（最后一段 role:"tool" 尾巴，其前是
+    # 带 tool_calls 的 assistant）；更早的历史结果剥壳重放，避免长对话中声明
+    # 随工具轮数线性累积（gptGrok A 对自注入 Sources 段的同一思路）。
+    current_round_start = -1
+    for idx in range(len(messages) - 1, -1, -1):
+        role_scan = str(messages[idx].get("role", ""))
+        if role_scan == "tool":
+            current_round_start = idx
+        elif role_scan == "assistant" and messages[idx].get("tool_calls") and current_round_start >= 0:
+            break  # 当轮的发起者，其后的 tool 连续段即当轮结果
+        else:
+            break  # 尾部不是未回应的工具结果 → 无当轮，全部按历史剥壳
+    for idx, message in enumerate(messages):
         role = str(message.get("role", "user"))
         content = message.get("content")
         if role == "user":
@@ -425,6 +438,7 @@ def convert_messages(
                 tool_name=tool_name,
                 content=tool_result_text,
                 max_chars=tool_result_max_chars,
+                wrap_notice=idx >= current_round_start >= 0,
             )
         elif role == "assistant" and not content:
             continue

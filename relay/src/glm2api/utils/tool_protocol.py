@@ -130,18 +130,41 @@ def truncate_tool_result(content: str, max_chars: int | None) -> str:
     return content[:head] + notice + content[-tail:]
 
 
+def _strip_trust_shell(content: str) -> str:
+    """剥离内容中已内嵌的信任声明与结束标记（P0-3 去累积）。
+
+    客户端回显或中转内部回灌可能把上一轮加过壳的文本再送回来 —— 重序列化时
+    若不剥离，同一份结果每轮多一层壳（N 次调用 = N 份声明）。结束标记同时
+    防伪造：内容里冒充的收尾标记一律剥掉，真标记由本函数统一补上。
+    """
+    if TOOL_RESULT_TRUST_NOTICE in content:
+        content = content.replace(TOOL_RESULT_TRUST_NOTICE, "")
+    if TOOL_RESULT_END_MARKER in content:
+        content = content.replace(TOOL_RESULT_END_MARKER, "")
+    return content.strip("\n").strip()
+
+
 def serialize_tool_result_block(
     tool_call_id: object,
     tool_name: str,
     content: str,
     max_chars: int | None = None,
+    wrap_notice: bool = True,
 ) -> str:
+    """序列化工具结果为 DSML 块。
+
+    wrap_notice=False 时不加信任声明壳 —— 用于拍平历史消息（P0-3）：声明只在
+    当轮结果上加，历史结果剥壳重放，避免长对话中声明随轮数线性累积。
+    """
+    content = _strip_trust_shell(content)
     content = truncate_tool_result(content, max_chars)
     safe_content = content.replace("]]>", "]]]]><![CDATA[>")
     block = (
         f'<|DSML|tool_result call_id="{_xml_escape_text(str(tool_call_id or "unknown"))}" '
         f'name="{_xml_escape_text(tool_name)}"><content><![CDATA[{safe_content}]]></content></|DSML|tool_result>'
     )
+    if not wrap_notice:
+        return block
     return f"{TOOL_RESULT_TRUST_NOTICE}\n{block}\n{TOOL_RESULT_END_MARKER}"
 
 
