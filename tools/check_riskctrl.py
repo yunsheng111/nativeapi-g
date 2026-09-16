@@ -9,6 +9,8 @@
     P2  工具契约修复 + 体积治理/信任壳        （断言 B1-B7 + T3 + C1-C6）
     P2#6 DSML 写入 content 抢救              （断言 M1-M7，12.6 失败样本两族回归）
     P2.6/P0-1 状态码分类 + 401 权威标记       （断言 K1-K8，S6 的 401 用例随语义收紧）
+    P2.6/I1  身份字段单一数据源 + 矛盾自检     （断言 I1-a..I1-g，F4 观测性回归）
+    B2  token 别名表 + CAS 替换               （断言 A1-a~f：轮换后真实 deid 不断链）
 
 用法：
     python tools/check_riskctrl.py
@@ -142,6 +144,72 @@ def check_d1(tmp: Path, deid: str) -> None:
     finally:
         GLMAccessTokenManager.device_id_resolver = saved
     return mgr
+
+
+# --------------------------------------------------------------- B2 token 别名链
+
+def check_alias(tmp: Path, tok1: str, deid: str) -> None:
+    """B2（生态调研）：token 别名表 + CAS 替换 —— 上游轮换 refresh_token 重写
+    token.txt 后，accounts.json 挂在旧指纹上的真实设备身份不断链。
+
+    前置：check_d1 已为 tok1 写入 deid 条目；glmrelay 已导入（轮换监听器已安装）。
+    """
+    from glm2api.services.glm_auth import GLMAccessTokenManager
+    from glmrelay.accounts.registry import resolve_device_id
+    from glmrelay.accounts.store import TokenStore, fingerprint
+
+    store = TokenStore(tmp / "token.txt", tmp / "accounts.json")
+    new1 = "tok-rotated-" + "c" * 24
+    new2 = "tok-rotated2-" + "d" * 24
+
+    # A1-a 轮换后按新 token 解析出原 device_id（别名继承生效）
+    rotated = store.rotate_token_alias(tok1, new1)
+    check(
+        rotated is not None and resolve_device_id(new1) == deid,
+        "A1-a 轮换后 resolve_device_id(新token) 解析出真实 deid",
+        f"got={resolve_device_id(new1)!r}",
+    )
+
+    # A1-b 条目形态：旧条目挂 rotated_to 指针；新条目继承 device_id
+    meta = store.load_meta()
+    fp_old, fp_new = fingerprint(tok1), fingerprint(new1)
+    check(
+        meta.get(fp_old) is not None and meta[fp_old].rotated_to == fp_new,
+        "A1-b-a 旧条目 rotated_to 指向新指纹",
+    )
+    check(
+        meta.get(fp_new) is not None and meta[fp_new].device_id == deid,
+        "A1-b-b 新条目继承 device_id",
+    )
+
+    # A1-c 幂等：同参数重复登记不产生新条目（CAS 命中直接返回已有条目）
+    before = set(meta)
+    again = store.rotate_token_alias(tok1, new1)
+    check(
+        again is not None and set(store.load_meta()) == before,
+        "A1-c 重复 rotate 幂等（不新增条目）",
+    )
+
+    # A1-d 旧条目缺失 → 返回 None（无从继承，调用方自行 record 全新条目）
+    orphan = "tok-orphan-" + "e" * 24
+    check(store.rotate_token_alias(orphan, new2) is None, "A1-d 旧条目缺失时 rotate 返回 None")
+
+    # A1-e 链上解析：TOK1→NEW→NEW2 连续两轮轮换后仍解析出原 deid
+    check(
+        store.rotate_token_alias(new1, new2) is not None and resolve_device_id(new2) == deid,
+        "A1-e 连续两轮轮换后 resolve_device_id 仍解析出真实 deid",
+        f"got={resolve_device_id(new2)!r}",
+    )
+
+    # A1-f 底座钩子形态：glmrelay 导入时已安装，且可置 None 恢复（可关闭性）。
+    # 不真跑刷新，只断言类属性存在且可置空。
+    saved = GLMAccessTokenManager.token_rotation_listener
+    try:
+        check(saved is not None, "A1-f-a 轮换监听器已由 glmrelay 导入安装")
+        GLMAccessTokenManager.token_rotation_listener = None
+        check(GLMAccessTokenManager.token_rotation_listener is None, "A1-f-b 监听器可置 None（可关闭性）")
+    finally:
+        GLMAccessTokenManager.token_rotation_listener = saved
 
 
 # --------------------------------------------------------------- D3
@@ -1290,6 +1358,7 @@ def main() -> int:
         mgr = GLMAccessTokenManager(cfg, logging.getLogger("check_env"))
         check_d4(mgr)
         check_d1(tmp, _deid)
+        check_alias(tmp, _tok1, _deid)
         check_d3(tmp)
         check_p01(tmp)
         check_p02(tmp)

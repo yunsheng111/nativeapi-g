@@ -31,4 +31,25 @@ def _install_device_id_hook() -> None:
         pass
 
 
+def _install_token_rotation_hook() -> None:
+    """B2：token 被上游轮换时登记别名链，保住真实设备身份不被断链。
+
+    底座轮换 refresh_token 是整文件重写 token.txt，而 accounts.json 的设备身份
+    条目按旧 token 指纹索引 —— 不登记别名的话，首次自动轮换后
+    resolve_device_id 就查不到新 token。监听器在轮换发生时把 (旧, 新) token 对
+    交给 store.rotate_token_alias（CAS 幂等）。扩展层可选：安装失败不阻断底座
+    启动，仅退化为「轮换后身份解析回退稳定随机值，直到重新导入」。
+    """
+    try:
+        from glm2api.services.glm_auth import GLMAccessTokenManager
+
+        from .accounts.registry import _token_file
+        from .accounts.store import TokenStore
+
+        GLMAccessTokenManager.token_rotation_listener = TokenStore(_token_file()).rotate_token_alias
+    except Exception:  # pragma: no cover
+        pass
+
+
 _install_device_id_hook()
+_install_token_rotation_hook()

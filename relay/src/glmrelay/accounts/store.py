@@ -17,7 +17,7 @@ import json
 import os
 import re
 import tempfile
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
@@ -205,6 +205,9 @@ class AccountMeta:
     imported_at: str = ""
     last_seen_at: str = ""
     note: str = ""
+    # 别名链指针（B2）：本指纹的 token 被上游轮换成新 token 后，指向新 token 的
+    # 指纹。链方向永远是 旧 → 新，resolve_device_id 据此做防环回溯。
+    rotated_to: str = ""
     extra: dict = field(default_factory=dict)
 
     @classmethod
@@ -343,6 +346,59 @@ class TokenStore:
         meta[key] = entry
         self.save_meta(meta)
         return entry
+
+    def rotate_token_alias(self, old_token: str, new_token: str) -> "AccountMeta | None":
+        """token 轮换别名登记（CAS 幂等）：把旧指纹条目整体继承给新指纹。
+
+        为什么需要：底座轮换 refresh_token 时是整文件重写 token.txt，accounts.json
+        的设备身份条目仍挂在旧 token 指纹上 —— 不登记别名的话，首次自动轮换后
+        resolve_device_id 就查不到新 token，真实 chatglm-deid 解析断链，重启后
+        回退稳定随机值。本方法形成单向别名链（旧.rotated_to = 新指纹）：
+
+            fp_old --rotated_to--> fp_new1 --rotated_to--> fp_new2 ...
+
+        链上每个新条目都完整继承旧条目（device_id / label / imported_at / extra
+        等），只有 fingerprint 换新、last_seen_at 刷新、rotated_to 清空（新条目
+        是链尾）；旧条目保留原 device_id 并追加 rotated_to 指针。一次 save_meta
+        同时落盘新旧两条，原子性由 _atomic_write 保证。
+
+        返回值：
+            AccountMeta  新指纹条目（本次继承生成，或 CAS 命中已存在的）；
+            None         旧指纹无条目，无从继承 —— 调用方应自行 record 全新条目。
+
+        幂等性：新旧同指纹（没真轮换）直接返回现有条目不写盘；新指纹条目已
+        存在视为重复登记，直接返回它，不产生新条目。
+        """
+        old_token = (old_token or "").strip()
+        new_token = (new_token or "").strip()
+        if not old_token or not new_token:
+            return None
+        old_fp = fingerprint(old_token)
+        new_fp = fingerprint(new_token)
+        meta = self.load_meta()
+        if old_fp == new_fp:
+            # 没有真轮换（上游回显了同一个 token），无事可做
+            return meta.get(new_fp)
+        # CAS：新条目已存在 → 之前登记过，幂等返回，不重写盘
+        existing_new = meta.get(new_fp)
+        if existing_new is not None:
+            return existing_new
+        old_entry = meta.get(old_fp)
+        if old_entry is None:
+            return None
+        # 复制旧条目全部字段（replace 浅拷贝，extra 必须单独特拷防两条目共享可变字典）
+        new_entry = replace(
+            old_entry,
+            fingerprint=new_fp,
+            rotated_to="",
+            last_seen_at=now_iso(),
+            extra=dict(old_entry.extra),
+        )
+        old_entry.rotated_to = new_fp
+        meta[new_fp] = new_entry
+        meta[old_fp] = old_entry
+        self.save_meta(meta)
+        return new_entry
 
     # ------------------------------------------------------------- 组合视图
 

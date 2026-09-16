@@ -116,6 +116,10 @@ class GLMAccessTokenManager:
     # 扩展点（D1）：glmrelay 在导入时安装，按 refresh_token 返回导入时抓到的
     # 真实设备标识（chatglm-deid）。底座不感知 accounts.json 的存在。
     device_id_resolver: Callable[[str], str] | None = None
+    # 扩展点（B2）：glmrelay 在导入时安装，refresh_token 被上游轮换写回时收到
+    # (旧 token, 新 token) 通报，用于登记 accounts.json 的别名链，保住挂在旧
+    # 指纹上的真实设备身份。底座不感知 accounts.json 的存在。
+    token_rotation_listener: Callable[[str, str], None] | None = None
     # 扩展点（P1-b）：glmrelay 的健康探测与管理面板从这里读取活跃实例。
     # 本服务为单实例进程，最后创建者即活跃实例。
     last_instance: "GLMAccessTokenManager | None" = None
@@ -335,10 +339,21 @@ class GLMAccessTokenManager:
         if response.status != 200 or code not in {0, None} or not access_token:
             raise RuntimeError(f"刷新 GLM token 失败: {payload}")
         if refresh_token != account.refresh_token:
+            old_token = account.refresh_token  # 赋新值前先取旧值：别名登记需要轮换前后的 token 对
             try:
                 self._persist_refresh_token(account_index, refresh_token)
             except Exception as exc:
                 self.logger.warning("写回 GLM refresh_token 失败 index=%s error=%s", account_index, exc)
+            # 扩展点（B2）：把 (旧, 新) token 对通报给扩展层登记别名链；登记失败
+            # 只影响重启后的身份解析，不得阻断刷新主流程。
+            listener = type(self).token_rotation_listener
+            if listener is not None:
+                try:
+                    listener(old_token, refresh_token)
+                except Exception as exc:
+                    self.logger.warning(
+                        "token 轮换别名登记失败 index=%s error=%s", account_index, exc
+                    )
             account.refresh_token = refresh_token
             self.config.glm_refresh_tokens[account_index] = refresh_token
             if account_index == 0:
