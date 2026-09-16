@@ -947,6 +947,31 @@ class CdpFetchTransport:
             raise
 
 
+def _warn_identity_once(transport_name: str, request: urllib.request.Request, tag: str, logger: logging.Logger) -> None:
+    """传输选择点的身份矛盾自检（P1-2/B1，报告二 7.2 边界：只自检不伪造）。
+
+    每次传输选择时构造该路的身份画像并校验；warn_identity_conflicts 内部
+    按 (transport, 矛盾文本) 去重，重复矛盾不会刷屏。自检失败静默跳过
+    （可观测性辅助路径，不得影响请求主链路）。
+    """
+    try:
+        from glm2api.core import transport as transport_mod
+        from glm2api.services.glm_auth import GLMAccessTokenManager
+
+        from ..identity import build_profile_from_headers, warn_identity_conflicts
+
+        headers = dict(request.header_items()) if isinstance(request, urllib.request.Request) else {}
+        device_id = ""
+        hint = transport_mod.current_request_account()
+        manager = GLMAccessTokenManager.last_instance
+        if manager is not None and hint is not None:
+            device_id = manager.get_device_id_for_account(hint)
+        profile = build_profile_from_headers(transport_name, device_id, headers)
+        warn_identity_conflicts(profile, logger, tag)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def install_transport_route(config, logger: logging.Logger) -> bool:
     """装配路由 opener 并注入 seam；返回是否实际接管（GLM_TRANSPORT=cdp 时）。"""
     from glm2api.core import transport
@@ -984,6 +1009,7 @@ def install_transport_route(config, logger: logging.Logger) -> bool:
         channel = canary.pick(wanted, explicit=explicit is not None)
         tag = _account_tag()
         if channel != "cdp":
+            _warn_identity_once("urllib", request, tag, logger)
             ok = True
             try:
                 return urllib_open(request, timeout=timeout)
@@ -995,6 +1021,7 @@ def install_transport_route(config, logger: logging.Logger) -> bool:
         if cdp.breaked():
             # 熔断打开期不计 canary 统计（cdp 内部熔断已在管），只静默走 urllib
             return urllib_open(request, timeout=timeout)
+        _warn_identity_once("cdp", request, tag, logger)
         try:
             response = cdp.open_(request, timeout=timeout)
         except CdpTransportRetry as exc:

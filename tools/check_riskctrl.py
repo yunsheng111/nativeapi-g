@@ -1340,6 +1340,123 @@ def check_p11(tmp: Path) -> None:
     check(not hits, "GH2 已跟踪文件零抓包产物命中", ", ".join(hits[:5]))
 
 
+# --------------------------------------------------------------- P2.5-2 I1 身份字段单一数据源 + 矛盾自检
+
+def check_identity(tmp: Path) -> None:
+    from glmrelay.identity import (
+        IdentityProfile,
+        build_profile_from_headers,
+        reset_identity_warnings,
+        validate_identity,
+        warn_identity_conflicts,
+    )
+
+    browser_ua = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0"
+    )
+
+    # I1-a urllib + 浏览器 UA → F4 指纹矛盾可观测（TLS 是 Python 栈，头却自称浏览器）
+    profile_a = build_profile_from_headers("urllib", "deid-a", {"User-Agent": browser_ua})
+    conflicts_a = validate_identity(profile_a)
+    check(
+        any("F4" in c and "Python 栈" in c for c in conflicts_a),
+        "I1-a urllib + 浏览器 UA → 矛盾列表含 F4 条目",
+        str(conflicts_a),
+    )
+
+    # I1-b 干净配置 → 零矛盾（自检不误伤诚实身份）
+    clean = IdentityProfile(
+        transport="urllib",
+        device_id="deid-clean-0001",
+        user_agent="glm2api/0.3 (Windows NT 10.0; Win64; x64)",
+        accept_language="zh-CN,zh;q=0.9",
+        x_lang="zh",
+        sec_ch_ua_platform='"Windows"',
+    )
+    check(validate_identity(clean) == [], "I1-b 干净配置（urllib+非伪装 UA+zh+真实 deid）→ 零矛盾",
+          str(validate_identity(clean)))
+
+    # I1-c 设备身份缺失必须显式暴露
+    profile_c = IdentityProfile(
+        transport="urllib", device_id="", user_agent="glm2api/0.3",
+        accept_language="zh-CN,zh;q=0.9", x_lang="zh", sec_ch_ua_platform="",
+    )
+    conflicts_c = validate_identity(profile_c)
+    check(
+        any("device_id" in c and "为空" in c for c in conflicts_c),
+        "I1-c device_id 为空 → 含设备身份条目",
+        str(conflicts_c),
+    )
+
+    # I1-d CDP 传输带 UA = bridge 禁止头剔除漏了的回归信号
+    profile_d = IdentityProfile(
+        transport="cdp", device_id="deid-d", user_agent=browser_ua,
+        accept_language="zh-CN,zh;q=0.9", x_lang="zh", sec_ch_ua_platform='"Windows"',
+    )
+    conflicts_d = validate_identity(profile_d)
+    check(
+        any("CDP" in c and "User-Agent" in c for c in conflicts_d),
+        "I1-d cdp 传输 + UA 非空 → 含『CDP 不应携带伪装 UA』条目",
+        str(conflicts_d),
+    )
+
+    # I1-e 头键大小写不敏感：get_browser_headers 输出是混合大小写键
+    profile_e = build_profile_from_headers(
+        "urllib",
+        "deid-e",
+        {
+            "User-Agent": browser_ua,
+            "accept-language": "zh-CN,zh;q=0.9",
+            "X-LANG": "zh",
+            "sec-ch-ua-platform": '"Windows"',
+        },
+    )
+    check(
+        profile_e.user_agent == browser_ua
+        and profile_e.accept_language == "zh-CN,zh;q=0.9"
+        and profile_e.x_lang == "zh"
+        and profile_e.sec_ch_ua_platform == '"Windows"',
+        "I1-e build_profile_from_headers 大小写不敏感取值",
+        f"ua={profile_e.user_agent[:24]}… lang={profile_e.accept_language} xlang={profile_e.x_lang} plat={profile_e.sec_ch_ua_platform}",
+    )
+
+    # I1-f 同一 (transport, 矛盾文本) 第二次调用不再落日志（防每请求刷屏）
+    logger = logging.getLogger("check_identity")
+    logs = LogCapture()
+    logger.addHandler(logs)
+    try:
+        warned = warn_identity_conflicts(profile_a, logger, "acct-a")
+        n_first = sum(1 for m in logs.messages if "身份自检矛盾" in m)
+        warn_identity_conflicts(profile_a, logger, "acct-a")
+        n_second = sum(1 for m in logs.messages if "身份自检矛盾" in m)
+    finally:
+        logger.removeHandler(logs)
+        reset_identity_warnings()
+    check(
+        len(warned) == 1 and n_first == 1,
+        "I1-f-a 首次告警逐条输出且返回全量矛盾列表",
+        f"returned={len(warned)} logged={n_first}",
+    )
+    check(
+        n_second == n_first,
+        "I1-f-b 同一 (transport, 矛盾) 二次调用不再输出",
+        f"first={n_first} second={n_second}",
+    )
+
+    # I1-g 语言自洽矛盾：X-Lang=zh 但 Accept-Language 不以 zh 开头
+    profile_g = IdentityProfile(
+        transport="urllib", device_id="deid-g", user_agent="glm2api/0.3",
+        accept_language="en-US", x_lang="zh", sec_ch_ua_platform="",
+    )
+    conflicts_g = validate_identity(profile_g)
+    check(
+        any("X-Lang=zh" in c and "en-US" in c for c in conflicts_g),
+        "I1-g x_lang=zh 但 accept_language=en-US → 含语言矛盾条目",
+        str(conflicts_g),
+    )
+
+
 def main() -> int:
     os.environ.pop("GLM_TOKEN_FILE", None)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
@@ -1374,6 +1491,7 @@ def main() -> int:
         check_runtime(tmp)
         check_p2(tmp)
         check_p6(tmp)
+        check_identity(tmp)
     finally:
         os.chdir(prev_cwd)
         shutil.rmtree(tmp, ignore_errors=True)
