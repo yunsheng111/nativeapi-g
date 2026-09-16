@@ -366,6 +366,49 @@ def check_runtime(tmp: Path) -> None:
     finally:
         health_mod._started = prev_started
 
+    # R7 keepalive 批处理（P2.5 第二批 B3）：临期才续命 + 每轮限量 + 摘除账号跳过
+    from glmrelay.accounts.health import probe_once as probe_once_r7
+
+    def failing_opener_r7(request, timeout=None):
+        probe_calls["n"] += 1
+        raise RuntimeError("network disabled in test")
+
+    # R5 的 finally 已把 last_instance 置 None，本组自建 manager
+    mgr7 = GLMAccessTokenManager(load_config(str(tmp / ".env")), logging.getLogger("check_r7"))
+    GLMAccessTokenManager.last_instance = mgr7
+    transport.set_upstream_transport(failing_opener_r7)
+    try:
+        # 场景 1：全部临期（缓存剩 100s < 300s 阈值），batch_limit=1 → 只有 1 次续命尝试
+        for i in range(mgr7.get_account_count()):
+            mgr7._accounts[i].cached_token = AccessToken(access_token="t", refresh_token="r", expires_at=time.time() + 100)
+            mgr7._accounts[i].breaker_until = 0.0
+            mgr7._accounts[i].probe_failures = 0
+        n0 = probe_calls["n"]
+        probed = probe_once_r7(logging.getLogger("probe"), batch_limit=1)
+        check(probe_calls["n"] - n0 == 1, "R7-a 临期账号 keepalive 每轮限量 1 次续命尝试（失败也占名额）", f"{probe_calls['n'] - n0}")
+        # index0 强制续命失败不计数；index1 名额用尽；index2 游客缓存命中零成本确认 → 仅 1
+        check(probed == 1, "R7-b 续命失败不计数、游客缓存命中零成本确认", f"probed={probed}")
+        # 场景 2：摘除中的账号跳过，不占名额也不打上游（不限量时其余账号全量探）
+        for i in range(mgr7.get_account_count()):
+            mgr7._accounts[i].cached_token = None
+        mgr7._accounts[0].breaker_until = time.time() + 600
+        mgr7._accounts[0].probe_failures = 0
+        n1 = probe_calls["n"]
+        probe_once_r7(logging.getLogger("probe"), batch_limit=0)
+        check(probe_calls["n"] - n1 == mgr7.get_account_count() - 1, "R7-c 摘除中账号探活跳过不打上游", f"{probe_calls['n'] - n1}")
+        # 场景 3：缓存健康的账号零成本确认且不占批量名额
+        for i in range(mgr7.get_account_count()):
+            mgr7._accounts[i].cached_token = AccessToken(access_token="t", refresh_token="r", expires_at=time.time() + 3000)
+            mgr7._accounts[i].breaker_until = 0.0
+            mgr7._accounts[i].probe_failures = 0
+        n2 = probe_calls["n"]
+        probed = probe_once_r7(logging.getLogger("probe"), batch_limit=1)
+        check(probe_calls["n"] == n2, "R7-d 缓存健康账号零成本确认不占批量名额", f"{probe_calls['n'] - n2}")
+        check(probed == mgr7.get_account_count(), "R7-e 零成本确认计入健康账号数", f"probed={probed}")
+    finally:
+        transport.set_upstream_transport(None)
+        GLMAccessTokenManager.last_instance = None
+
 
 # --------------------------------------------------------------- P2 工具契约
 
