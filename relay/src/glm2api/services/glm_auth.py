@@ -10,7 +10,7 @@ import time
 import uuid
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from logging import Logger
 from typing import Callable
 
@@ -107,6 +107,9 @@ class AccountState:
     last_used_at: float = 0.0
     last_success_at: float = 0.0
     last_error: str = ""
+    # P0-7 新账号宽限：进入账号池的时刻。宽限窗口内的失败不计入通用熔断
+    # （网络抖动不至误摘稀缺账号）；风控信号不豁免（register_risk_event 独立路径）。
+    created_at: float = field(default_factory=time.time)
 
 
 class GLMAccessTokenManager:
@@ -525,7 +528,12 @@ class GLMAccessTokenManager:
                 acc.last_used_at = time.time()
 
     def record_result(self, account_index: int, ok: bool, error: str = "") -> bool:
-        """回填一次上游请求结果（成功=HTTP 建联成功）。返回是否触发熔断摘除。"""
+        """回填一次上游请求结果（成功=HTTP 建联成功）。返回是否触发熔断摘除。
+
+        P0-7：账号进入账号池后 GLM_ACCOUNT_GRACE_SECONDS 内的失败只记录不计入
+        通用熔断 —— 新导入账号立即遇网络抖动不应被误摘；风控冷却不受宽限豁免
+        （封禁信号不该被宽限吞掉，见 register_risk_event 独立路径）。
+        """
         with self._lock:
             if not (0 <= account_index < len(self._accounts)):
                 return False
@@ -536,8 +544,11 @@ class GLMAccessTokenManager:
                 acc.last_error = ""
                 return False
             acc.total_failures += 1
-            acc.consecutive_failures += 1
             acc.last_error = (error or "")[:200]
+            grace = int(self.config.glm_account_grace_seconds or 0)
+            if grace > 0 and time.time() - acc.created_at < grace:
+                return False
+            acc.consecutive_failures += 1
             if acc.consecutive_failures >= BREAKER_FAILURE_THRESHOLD and time.time() >= acc.breaker_until:
                 acc.breaker_until = time.time() + BREAKER_COOLDOWN_SECONDS
                 acc.consecutive_failures = 0

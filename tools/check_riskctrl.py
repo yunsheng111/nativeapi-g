@@ -281,6 +281,7 @@ def check_runtime(tmp: Path) -> None:
 
     logger = logging.getLogger("check_runtime")
     cfg = load_config(str(tmp / ".env"))
+    cfg.glm_account_grace_seconds = 0  # 本组测熔断语义本身；宽限语义见 check_p07
     mgr = GLMAccessTokenManager(cfg, logger)
     GLMAccessTokenManager.last_instance = mgr
 
@@ -993,6 +994,60 @@ def check_p06(tmp: Path) -> None:
     check(events3 == [{"n": 1}, {"n": 2}], "WD3 正常两帧流完整解析", str(events3))
 
 
+# --------------------------------------------------------------- P2.6 P0-7 新账号宽限
+
+def check_p07(tmp: Path) -> None:
+    from glm2api.config import load_config
+    from glm2api.services.glm_auth import GLMAccessTokenManager
+    from glm2api.services.glm_client import UpstreamAPIError
+
+    logger = logging.getLogger("check_p07")
+    cfg = load_config(str(tmp / ".env"))
+    cfg.glm_account_grace_seconds = 600
+    mgr = GLMAccessTokenManager(cfg, logger)
+
+    # GR1 宽限期内连续 3 次失败不摘除（账号稀缺，网络抖动不该误摘）
+    for _ in range(3):
+        mgr.record_request(0)
+        mgr.record_result(0, False, "transient")
+    check(not mgr.is_account_breaked(0), "GR1-a 宽限期内连续 3 败不进熔断")
+    check(mgr.is_account_available(0), "GR1-b failover 仍可选该账号")
+    stats = mgr.get_account_stats()[0]
+    check(
+        stats["total_failures"] == 3 and stats["consecutive_failures"] == 0,
+        "GR1-c 失败有记录但不进熔断计数",
+        str(stats),
+    )
+    check(stats["last_error"] == "transient", "GR1-d last_error 照常记录")
+
+    # GR2 宽限期后行为不变（回拨 created_at 11 分钟）
+    mgr._accounts[0].created_at = time.time() - 660
+    for _ in range(3):
+        mgr.record_request(0)
+        mgr.record_result(0, False, "down")
+    check(mgr.is_account_breaked(0), "GR2 宽限期满后连续 3 败照常摘除")
+    for i in range(mgr.get_account_count()):
+        mgr._accounts[i].breaker_until = 0.0
+
+    # GR3 宽限期内风控冷却照常生效（拍板点 3：封禁信号不被宽限吞掉）
+    mgr2 = GLMAccessTokenManager(load_config(str(tmp / ".env")), logger)
+    mgr2.config.glm_account_grace_seconds = 600
+    exc403 = UpstreamAPIError(403, "f", {})
+    for _ in range(3):
+        mgr2.register_risk_event(0, exc403)
+    check(mgr2.is_account_cooling_down(0), "GR3-a 宽限期内风控三连 → 照常冷却")
+    check(not mgr2.is_account_breaked(0), "GR3-b 熔断与风控分源，宽限不混淆两者")
+
+    # GR4 宽限可关闭：grace=0 时行为与旧版一致
+    cfg0 = load_config(str(tmp / ".env"))
+    cfg0.glm_account_grace_seconds = 0
+    mgr3 = GLMAccessTokenManager(cfg0, logger)
+    for _ in range(3):
+        mgr3.record_request(0)
+        mgr3.record_result(0, False, "down")
+    check(mgr3.is_account_breaked(0), "GR4 grace=0 连续 3 败立即摘除（可关闭性）")
+
+
 def main() -> int:
     os.environ.pop("GLM_TOKEN_FILE", None)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
@@ -1018,6 +1073,7 @@ def main() -> int:
         check_p04(tmp)
         check_p05(tmp)
         check_p06(tmp)
+        check_p07(tmp)
         check_runtime(tmp)
         check_p2(tmp)
         check_p6(tmp)

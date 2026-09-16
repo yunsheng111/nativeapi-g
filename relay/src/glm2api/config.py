@@ -166,6 +166,7 @@ class AppConfig:
     glm_tool_result_max_chars: int
     glm_context_max_tokens: int
     glm_stream_max_seconds: int
+    glm_account_grace_seconds: int
     blocked_tool_names: list[str]
     exposed_models: list[str]
     model_aliases: dict[str, str]
@@ -304,6 +305,8 @@ def load_config(env_file: str = ".env") -> AppConfig:
         glm_context_max_tokens=max(0, parse_int(values.get("GLM_CONTEXT_MAX_TOKENS"), 0)),
         # P0-6 SSE 硬超时看门狗：单条流最长存活时间（对照 chatgpt2api 单流挂 29.5 分钟事故），0 = 关闭
         glm_stream_max_seconds=max(0, parse_int(values.get("GLM_STREAM_MAX_SECONDS"), 600)),
+        # P0-7 新账号失败宽限：进入账号池后 N 秒内失败不计入通用熔断（风控不豁免），0 = 关闭
+        glm_account_grace_seconds=max(0, parse_int(values.get("GLM_ACCOUNT_GRACE_SECONDS"), 600)),
         blocked_tool_names=parse_list(values.get("BLOCKED_TOOL_NAMES"), DEFAULT_BLOCKED_TOOL_NAMES),
         exposed_models=exposed_models,  # type: ignore
         model_aliases=model_aliases,
