@@ -22,7 +22,7 @@ from logging import Logger
 from typing import Callable
 
 from ..config import AppConfig
-from ..core.transport import open_upstream
+from ..core.transport import open_upstream, set_request_account
 from ..logging_utils import debug_dump
 from .glm_auth import GLMAccessTokenManager, build_sign
 from .translator import (
@@ -1084,6 +1084,9 @@ class GLMWebClient:
                 try:
                     for attempt in range(guest_retry_limit + 1):
                         try:
+                            # 账号提示（P2.5 第二批）：CDP BrowserContext 池按它把
+                            # 请求路由到本账号专属 context；随 attempt 结束清理。
+                            set_request_account(account_index)
                             self._apply_request_pacing(account_index)
                             # 统计口径：一次 attempt = 一次完整上游尝试（含 token 刷新）；
                             # operation 返回 = 建联成功；流中途的失败属于流层（keepalive/
@@ -1093,11 +1096,12 @@ class GLMWebClient:
                             result = operation(account_index, access_token)
                             self.auth.record_result(account_index, True)
                             executed = True
+                            set_request_account(None)
                             return result
                         except Exception as exc:
+                            set_request_account(None)
                             last_exc = exc
-                            self.auth.record_result(account_index, False, str(exc))
-                            # P0-1 分类先行：风控判定（401 需权威标记）与切号判定
+                            self.auth.record_result(account_index, False, str(exc))                            # P0-1 分类先行：风控判定（401 需权威标记）与切号判定
                             # （TRANSIENT 不切号）都由 auth 按分类给出。
                             is_risk = self.auth.classify_risk_event(exc)
                             if is_risk:

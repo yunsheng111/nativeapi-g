@@ -270,6 +270,32 @@ class GLMAccessTokenManager:
         with self._lock:
             return self._get_access_token_for_index(account_index)
 
+    def get_token_ttl_seconds(self, account_index: int) -> float | None:
+        """access_token 缓存剩余秒数（P2.5 第二批 keepalive 批处理用）。
+
+        None = 无缓存（下任一使用方都会发起真实刷新）；>0 = 缓存有效剩余量。
+        健康探测据此挑「临期」账号主动续命，而不是全量扫。
+        """
+        with self._lock:
+            if not (0 <= account_index < len(self._accounts)):
+                return None
+            cached = self._accounts[account_index].cached_token
+            if cached is None:
+                return None
+            return cached.expires_at - time.time()
+
+    def refresh_account_token(self, account_index: int) -> str:
+        """强制刷新该账号的 access_token（P2.5 第二批 keepalive 续命入口）。
+
+        get_access_token_for_account 的缓存命中线（剩余 >60s）比探活的临期
+        阈值（300s）低 —— 介于两者之间的账号按 get 语义会命中缓存、续命不会
+        真实发生；本入口绕过缓存直接刷新，供健康探测在缓存跌破阈值前续命。
+        """
+        with self._lock:
+            account = self._accounts[account_index]
+            account.cached_token = self._refresh_access_token(account_index)
+            return account.cached_token.access_token
+
     def _get_access_token_for_index(self, account_index: int) -> str:
         account = self._accounts[account_index]
         if account.cached_token and time.time() < account.cached_token.expires_at - 60:

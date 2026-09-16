@@ -28,6 +28,10 @@ _block_private: bool = True
 # 头与模型后缀后设置，routed opener 读取；优先级高于全局 GLM_TRANSPORT。
 _hint = threading.local()
 
+# 请求级账号提示（P2.5 第二批，D2）：failover 的每次尝试前由 glm_client 设置，
+# 供 CDP BrowserContext 池做「账号 → context」路由与 canary 统计打脱敏账号标签。
+# 只在线程内生效，随 attempt 结束清理 —— 不进 HTTP 头，上游不可见。
+
 # RFC 2544 benchmark 段（198.18.0.0/15）：TUN 代理的 fake-IP 模式用它承载到公网的
 # 连接，不指向任何真实内网服务 —— 从私网阻断中例外，否则代理环境下正常请求被打死。
 _FAKEIP_NETWORKS = tuple(ipaddress.ip_network(n) for n in ("198.18.0.0/15",))
@@ -84,3 +88,13 @@ def set_request_transport(name: str | None) -> None:
 def current_request_transport() -> str | None:
     name = getattr(_hint, "name", None)
     return name if name in ("cdp", "urllib") else None
+
+
+def set_request_account(account_index: int | None) -> None:
+    """设置当前线程的账号提示（P2.5 第二批）：CDP 池据此路由 BrowserContext。"""
+    _hint.account = account_index
+
+
+def current_request_account() -> int | None:
+    account = getattr(_hint, "account", None)
+    return account if isinstance(account, int) else None

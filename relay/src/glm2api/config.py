@@ -155,6 +155,7 @@ class AppConfig:
     glm_request_jitter_ms: int
     glm_guest_stagger_seconds: float
     glm_health_probe_seconds: int
+    glm_health_keepalive_batch: int
     glm_transport_block_private: bool
     glm_transport: str
     glm_cdp_headless: bool
@@ -163,6 +164,11 @@ class AppConfig:
     glm_cdp_origin: str
     glm_cdp_breaker_threshold: int
     glm_cdp_breaker_seconds: float
+    glm_cdp_account_contexts: bool
+    glm_canary_enabled: bool
+    glm_canary_every_n: int
+    glm_canary_failure_threshold: int
+    glm_canary_cooldown_seconds: float
     glm_tool_result_max_chars: int
     glm_context_max_tokens: int
     glm_stream_max_seconds: int
@@ -293,6 +299,8 @@ def load_config(env_file: str = ".env") -> AppConfig:
         glm_request_jitter_ms=max(0, parse_int(values.get("GLM_REQUEST_JITTER_MS"), 200)),
         glm_guest_stagger_seconds=max(0.0, parse_float(values.get("GLM_GUEST_STAGGER_SECONDS"), 5.0)),
         glm_health_probe_seconds=max(0, parse_int(values.get("GLM_HEALTH_PROBE_SECONDS"), 300)),
+        # P2.5 第二批 keepalive 批处理：每轮真实续命的账号上限（0 = 不限量，旧行为）
+        glm_health_keepalive_batch=max(0, parse_int(values.get("GLM_HEALTH_KEEPALIVE_BATCH"), 3)),
         glm_transport_block_private=parse_bool(values.get("GLM_TRANSPORT_BLOCK_PRIVATE"), True),
         glm_transport=(lambda v: v if v in ("urllib", "cdp") else "urllib")(values.get("GLM_TRANSPORT", "urllib").strip().lower()),
         glm_cdp_headless=parse_bool(values.get("GLM_CDP_HEADLESS"), False),
@@ -301,6 +309,14 @@ def load_config(env_file: str = ".env") -> AppConfig:
         glm_cdp_origin=values.get("GLM_CDP_ORIGIN", "https://chatglm.cn").strip() or "https://chatglm.cn",
         glm_cdp_breaker_threshold=max(1, parse_int(values.get("GLM_CDP_BREAKER_THRESHOLD"), 3)),
         glm_cdp_breaker_seconds=max(1.0, parse_float(values.get("GLM_CDP_BREAKER_SECONDS"), 600.0)),
+        # P2.5 第二批 D2 定案：非游客账号各自专属 BrowserContext（cookie + Authorization 同源一致）；
+        # false 退回单 context（浏览器默认身份）旧形态。游客恒走默认 context。
+        glm_cdp_account_contexts=parse_bool(values.get("GLM_CDP_ACCOUNT_CONTEXTS"), True),
+        # P2.5 第二批 canary A/B 分流（11.4）：默认关闭只做统计记录，显式开启才参与选路
+        glm_canary_enabled=parse_bool(values.get("GLM_CANARY_ENABLED"), False),
+        glm_canary_every_n=max(1, parse_int(values.get("GLM_CANARY_EVERY_N"), 20)),
+        glm_canary_failure_threshold=max(1, parse_int(values.get("GLM_CANARY_FAILURE_THRESHOLD"), 3)),
+        glm_canary_cooldown_seconds=max(1.0, parse_float(values.get("GLM_CANARY_COOLDOWN_SECONDS"), 600.0)),
         glm_tool_result_max_chars=max(0, parse_int(values.get("GLM_TOOL_RESULT_MAX_CHARS"), 24000)),
         # P0-4 上下文长度保护（拍板点 2）：默认 0 = 关闭，先观测真实拍平体积分布再定默认值
         glm_context_max_tokens=max(0, parse_int(values.get("GLM_CONTEXT_MAX_TOKENS"), 0)),
