@@ -98,6 +98,7 @@ class LoginImportSession:
         headless: bool = False,
         snapshot_dir: Path | None = None,
         poll_interval: float = 1.5,
+        settle_seconds: float = 2.0,
     ) -> None:
         self.store = store
         self.profile_dir = Path(profile_dir)
@@ -106,6 +107,9 @@ class LoginImportSession:
         self.headless = headless
         self.snapshot_dir = Path(snapshot_dir) if snapshot_dir else None
         self.poll_interval = poll_interval
+        # P0-9 settle 稳定窗口：抓到候选后继续观察 N 秒，值变化取最新，
+        # 稳定一窗才入库（防半截凭据）；0 = 关闭（抓到即入库的旧行为）。
+        self.settle_seconds = settle_seconds
 
         self.session_id = uuid.uuid4().hex[:12]
         self.state = "created"
@@ -280,9 +284,27 @@ class LoginImportSession:
         if not token:
             return []
 
+        # P0-9 settle 稳定窗口（对照 turb-register 的 settle 思路）：抓到候选后
+        # 继续观察，值变化则采用最新值并继续观察，稳定一窗后才入库 —— 防止把
+        # 登录过程中尚未写完的半截凭据入库。变化链有兜底上限（5 窗），
+        # 到点时已有候选 → 用当前候选照常入库，不空手而归。
         device_id, device_key = pick_local_storage_value(
             items, DEVICE_KEY_CANDIDATES, matcher=looks_like_device_key
         )
+        if self.settle_seconds > 0:
+            chain_deadline = time.monotonic() + max(self.settle_seconds * 5, 1.0)
+            while time.monotonic() < chain_deadline:
+                time.sleep(self.settle_seconds)
+                re_items = self._read_local_storage()
+                re_token, re_key = pick_local_storage_value(
+                    re_items, TOKEN_KEY_CANDIDATES, matcher=looks_like_token_key
+                )
+                if not re_token or re_token == token:
+                    break
+                token, token_key = re_token, re_key
+                device_id, device_key = pick_local_storage_value(
+                    re_items, DEVICE_KEY_CANDIDATES, matcher=looks_like_device_key
+                )
 
         if not self._snapshot_done:
             self._write_snapshot(items, page_url, token_key, device_key)

@@ -1109,6 +1109,82 @@ def check_p08(tmp: Path) -> None:
     check(time.monotonic() - t0 < 0.05, "PT4 min_interval=0 时 pacing 零延迟")
 
 
+# --------------------------------------------------------------- P2.6 P0-9 importer settle 窗口
+
+def check_p09(tmp: Path) -> None:
+    from glmrelay.accounts.importer import LoginImportSession
+
+    class FakeEntry:
+        fingerprint = "fp123"
+
+    class FakeStore:
+        def __init__(self) -> None:
+            self.added: list[str] = []
+            self.recorded: list[dict] = []
+
+        def has_token(self, token: str) -> bool:
+            return False
+
+        def add_token(self, token: str) -> bool:
+            self.added.append(token)
+            return True
+
+        def record(self, token: str, **kw):
+            self.recorded.append({"token": token, **kw})
+            return FakeEntry()
+
+        def load_tokens(self) -> list[str]:
+            return list(self.added)
+
+    class FakeClient:
+        def page_state(self):
+            return {}
+
+    def make_session(seq: list[dict], settle: float):
+        store = FakeStore()
+        s = LoginImportSession(store=store, profile_dir=tmp / "imp", settle_seconds=settle)
+        s._client = FakeClient()
+        s.state = "waiting_login"
+        s._snapshot_done = True  # 跳过诊断快照落盘
+        it = iter(seq)
+        s._read_local_storage = lambda: next(it)
+        return s, store
+
+    # ST1 候选在观察窗内被更新 → 取最终值入库（A → B 稳定）
+    s, store = make_session(
+        [
+            {"chatglm_refresh_token": "tokA"},
+            {"chatglm_refresh_token": "tokB"},
+            {"chatglm_refresh_token": "tokB"},
+        ],
+        settle=0.15,
+    )
+    added = s.poll_once()
+    check(bool(added) and store.added == ["tokB"], "ST1 settle 窗口内候选被更新 → 取最终值", f"added={store.added}")
+
+    # ST2 稳定候选观察一窗即入库，不空等
+    s2, store2 = make_session(
+        [
+            {"chatglm_refresh_token": "tokS"},
+            {"chatglm_refresh_token": "tokS"},
+        ],
+        settle=0.15,
+    )
+    t0 = time.monotonic()
+    added2 = s2.poll_once()
+    took = time.monotonic() - t0
+    check(
+        bool(added2) and store2.added == ["tokS"] and took < 2.0,
+        "ST2 稳定候选按窗口入库不空等",
+        f"{took:.2f}s",
+    )
+
+    # ST3 settle=0 → 旧行为（抓到即入库，可关闭性）
+    s3, store3 = make_session([{"chatglm_refresh_token": "tokOld"}], settle=0.0)
+    added3 = s3.poll_once()
+    check(bool(added3) and store3.added == ["tokOld"], "ST3 settle=0 保持抓到即入库")
+
+
 def main() -> int:
     os.environ.pop("GLM_TOKEN_FILE", None)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
@@ -1136,6 +1212,7 @@ def main() -> int:
         check_p06(tmp)
         check_p07(tmp)
         check_p08(tmp)
+        check_p09(tmp)
         check_runtime(tmp)
         check_p2(tmp)
         check_p6(tmp)
