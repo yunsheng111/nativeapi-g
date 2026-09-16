@@ -826,6 +826,10 @@ class CdpFetchTransport:
 
     # -- 浏览器生命周期
 
+    def ensure_started(self) -> None:
+        """公开入口：确保浏览器与默认槽就绪（P2.5 第一批 API，live 自检脚本使用）。"""
+        self._ensure_browser()
+
     def _ensure_browser(self) -> None:
         with self._lock:
             if self._started and self._proc is not None and self._proc.poll() is None and self._browser_client is not None:
@@ -961,6 +965,10 @@ def _warn_identity_once(transport_name: str, request: urllib.request.Request, ta
         from ..identity import build_profile_from_headers, warn_identity_conflicts
 
         headers = dict(request.header_items()) if isinstance(request, urllib.request.Request) else {}
+        if transport_name == "cdp":
+            # 按实际将发给 fetch 的头自检（禁止头剔除已生效）——用原始头会把
+            # "稍后会被剔除的伪装 UA" 误报成矛盾
+            headers = extract_fetch_headers(request)
         device_id = ""
         hint = transport_mod.current_request_account()
         manager = GLMAccessTokenManager.last_instance
