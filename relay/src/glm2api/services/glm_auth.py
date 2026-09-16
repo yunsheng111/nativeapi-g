@@ -25,13 +25,32 @@ ACCESS_TOKEN_EXPIRES_SECONDS = 3600
 # deid —— 服务重启后自动回归真实身份。
 RISK_EVENT_THRESHOLD = 3
 RISK_COOLDOWN_SECONDS = 600
-# 视为风控信号的 HTTP 状态：401 签名/授权拒绝、403 封禁、405 游客通道被拒（社区实测）。
-# 429 单独判断：上游"其他对话生成中"的忙碌形态不算风控。
-RISK_STATUS_CODES = frozenset({401, 403, 405})
 # 熔断摘除（P1-b）：与风控冷却分源的通用失败熔断 —— 连续失败（无论原因）达阈值
 # 即摘除一段时间，到期后由 failover 半开重试；期间一次成功即清零。
 BREAKER_FAILURE_THRESHOLD = 3
 BREAKER_COOLDOWN_SECONDS = 600
+
+# P0-1 状态码分类（生态调研 A1/P0-2）：同一状态码在不同维度语义不同，先分类再处置。
+# TRANSIENT（404/409/423/5xx）：资源未就绪 / 上游抖动 —— 账号无辜，不切号
+# （404 切号既浪费账号又掩盖真实原因），失败仍计入通用熔断计数。
+TRANSIENT_STATUS_CODES = frozenset({404, 409, 423})
+# BUSY（429 + 忙碌形态）：沿用既有忙碌重试语义，不计风控。
+BUSY_INNER_STATUS = 10061
+BUSY_MESSAGE_MARKER = "请等待其他对话生成完毕"
+# send_request 忙碌重试耗尽后的自产错误文案（语义仍是忙碌而非风控，切号找空闲身份）
+BUSY_EXHAUSTED_MARKER = "长时间忙碌"
+# AUTH（401）的权威失效标记：仅 body 明确说"身份失效"才计入风控（冷却 + 换 device_id）；
+# 无标记的 401 只记失败走通用熔断 —— 封禁信号不得被无依据的猜测放大。
+AUTH_INVALIDATION_MARKERS = (
+    "登录",
+    "失效",
+    "过期",
+    "身份",
+    "认证",
+    "unauthorized",
+    "invalid token",
+    "token invalid",
+)
 
 
 def build_sign() -> tuple[str, str, str]:
@@ -370,37 +389,79 @@ class GLMAccessTokenManager:
         except OSError as exc:
             raise RuntimeError(f"写入 .env 失败: {env_path} error={exc}") from exc
 
-    def should_switch_account(self, exc: Exception) -> bool:
-        if hasattr(exc, "status_code"):
-            return True
-        if isinstance(exc, urllib.error.HTTPError):
-            return True
-        if isinstance(exc, urllib.error.URLError):
-            return True
-        if isinstance(exc, TimeoutError):
-            return True
-        if isinstance(exc, RuntimeError):
-            return "token" in str(exc).lower()
-        return False
+    def classify_upstream_error(self, exc: Exception) -> str:
+        """上游异常四分类（P0-1）：返回 TRANSIENT / BUSY / AUTH / RISK。
 
-    def classify_risk_event(self, exc: Exception) -> bool:
-        """判断异常是否为风控信号（D3）。
-
-        429 需要区分：payload 带 status=10061 或"请等待其他对话生成完毕"是
-        上游忙碌（已有独立的重试语义），不算风控；其余 429（限流爆发）计入。
+        分类先行，处置在后：TRANSIENT 不切号；BUSY 沿用忙碌重试语义；
+        AUTH 仅在 body 带权威失效标记时升级为风控；RISK 计风控。
         """
         status = getattr(exc, "status_code", None)
-        if status is not None:
+        if status is None and isinstance(exc, urllib.error.HTTPError):
+            status = exc.code
+        if isinstance(status, int):
             if status == 429:
-                payload = getattr(exc, "payload", None) or {}
-                message = str(payload.get("message", ""))
-                if payload.get("status") == 10061 or "请等待其他对话生成完毕" in message:
-                    return False
+                payload = getattr(exc, "payload", None)
+                message = str(payload.get("message", "")) if isinstance(payload, dict) else str(exc)
+                if (
+                    (isinstance(payload, dict) and payload.get("status") == BUSY_INNER_STATUS)
+                    or BUSY_MESSAGE_MARKER in message
+                    or BUSY_EXHAUSTED_MARKER in message
+                ):
+                    return "BUSY"
+                return "RISK"
+            if status == 401:
+                return "AUTH"
+            if status in (403, 405):
+                return "RISK"
+            # 404/409/423/5xx 及其余未知状态码：账号无辜，不切号
+            return "TRANSIENT"
+        # 无 HTTP 状态码：网络层错误（URLError/TimeoutError/socket.timeout/
+        # ConnectionError 均为 OSError 子类）属暂态，切号无济于事。
+        if isinstance(exc, OSError):
+            return "TRANSIENT"
+        if isinstance(exc, RuntimeError):
+            # token 生命周期异常（刷新失败 / 游客获取失败）：按 AUTH 处理（切号）；
+            # 是否升级风控由 is_authoritative_auth_failure 依据 body 文本判定。
+            text = str(exc).lower()
+            if "token" in text or "刷新" in text:
+                return "AUTH"
+            return "TRANSIENT"
+        return "TRANSIENT"
+
+    def is_authoritative_auth_failure(self, exc: Exception) -> bool:
+        """401 是否带上游权威失效标记（P0-1）。只有 body 明确说"身份失效"
+        才计风控；仅凭 HTTP 状态码本身不足以判定账号被封禁。"""
+        payload = getattr(exc, "payload", None)
+        if isinstance(payload, dict):
+            if payload.get("code") == 401 or payload.get("status") == 401:
                 return True
-            return status in RISK_STATUS_CODES
-        if isinstance(exc, urllib.error.HTTPError):
-            return exc.code in RISK_STATUS_CODES or exc.code == 429
-        return False
+            text = str(payload.get("message", ""))
+        elif isinstance(exc, urllib.error.HTTPError):
+            # 裸 HTTPError 只有头层信息，无权威 body 语义 → 未确认
+            return False
+        else:
+            text = str(exc)
+        lowered = text.lower()
+        return any(marker in text or marker in lowered for marker in AUTH_INVALIDATION_MARKERS)
+
+    def should_switch_account(self, exc: Exception) -> bool:
+        """是否切换账号（P0-1 语义：按分类决定，不再"有 status_code 就切号"）。
+
+        TRANSIENT（404/409/423/5xx/网络）不切号 —— 资源未就绪或链路抖动与账号
+        无关，切号浪费账号且掩盖真实原因；BUSY/AUTH/RISK 均切号。
+        """
+        return self.classify_upstream_error(exc) != "TRANSIENT"
+
+    def classify_risk_event(self, exc: Exception) -> bool:
+        """判断异常是否为风控信号（D3 语义，P0-1 收紧 401）。
+
+        = RISK 类（403/405/真限流 429），或 AUTH 且 body 带权威失效标记。
+        429 忙碌形态（10061 / "请等待其他对话生成完毕"）不算风控。
+        """
+        kind = self.classify_upstream_error(exc)
+        if kind == "RISK":
+            return True
+        return kind == "AUTH" and self.is_authoritative_auth_failure(exc)
 
     def register_risk_event(self, account_index: int, exc: Exception) -> bool:
         """记录一次风控事件；累计达阈值进入冷却并轮换设备身份。返回是否触发冷却。"""

@@ -8,6 +8,7 @@
     D3  并发节奏：单飞/全忙/冷却/分类/退避     （断言 S1-S9）
     P2  工具契约修复 + 体积治理/信任壳        （断言 B1-B7 + T3 + C1-C6）
     P2#6 DSML 写入 content 抢救              （断言 M1-M7，12.6 失败样本两族回归）
+    P2.6/P0-1 状态码分类 + 401 权威标记       （断言 K1-K8，S6 的 401 用例随语义收紧）
 
 用法：
     python tools/check_riskctrl.py
@@ -235,12 +236,14 @@ def check_d3(tmp: Path) -> None:
     for i in range(client.auth.get_account_count()):
         client.auth._accounts[i].cooldown_until = 0.0
 
-    # S6 风控分类：busy 10061 豁免；真限流 429 / 401 / 403 / 405 计入；500 不计入
+    # S6 风控分类：busy 10061 豁免；真限流 429 / 403 / 405 计入；500 不计入；
+    # 401 按 P0-1 收紧 —— 无权威 body 标记不计风控，带标记才计。
     busy = UpstreamAPIError(429, "x | status=10061 | 请等待其他对话生成完毕", {"status": 10061, "message": "请等待其他对话生成完毕"})
     cases = [
         (busy, False, "busy 10061 豁免"),
         (UpstreamAPIError(429, "too many", {"message": "too many"}), True, "真限流 429 计入"),
-        (UpstreamAPIError(401, "f", {}), True, "401 计入"),
+        (UpstreamAPIError(401, "f", {}), False, "401 无权威标记不计风控（P0-1 收紧）"),
+        (UpstreamAPIError(401, "token 已失效", {"code": 401, "message": "token 已失效"}), True, "401 带权威失效标记计入（P0-1）"),
         (UpstreamAPIError(403, "f", {}), True, "403 计入"),
         (UpstreamAPIError(405, "f", {}), True, "405 计入"),
         (UpstreamAPIError(500, "f", {}), False, "500 不计入"),
@@ -560,6 +563,101 @@ def check_p6(tmp: Path) -> None:
     check(calls == [] and visible == plain, "M7-c 普通正文不被误判", repr(visible))
 
 
+# --------------------------------------------------------------- P2.6 P0-1 状态码分类
+
+def check_p01(tmp: Path) -> None:
+    import urllib.error as ue
+    from glm2api.config import load_config
+    from glm2api.services.glm_client import GLMWebClient, UpstreamAPIError
+
+    logger = logging.getLogger("check_p01")
+    cfg = load_config(str(tmp / ".env"))
+    cfg.glm_request_jitter_ms = 0
+    cfg.glm_guest_stagger_seconds = 0
+    client = GLMWebClient(cfg, logger)
+    client.auth.get_access_token_for_account = lambda i: f"fake-token-{i}"
+    auth = client.auth
+    dev_before = auth.get_device_id_for_account(0)
+
+    # K1 TRANSIENT 状态码不切号（404/409/423/5xx）
+    for code in (404, 409, 423, 500, 502, 503):
+        check(
+            auth.should_switch_account(UpstreamAPIError(code, "x", {})) is False,
+            f"K1 HTTP {code} 不切号（TRANSIENT，旧实现一律切号）",
+        )
+    # K2 网络层错误不切号（切号救不了链路问题）
+    check(auth.should_switch_account(ue.URLError("conn refused")) is False, "K2-a URLError 不切号")
+    check(auth.should_switch_account(TimeoutError("timed out")) is False, "K2-b TimeoutError 不切号")
+    # K3 BUSY / AUTH / RISK 仍切号
+    check(
+        auth.should_switch_account(UpstreamAPIError(429, "x", {"status": 10061, "message": "请等待其他对话生成完毕"})) is True,
+        "K3-a BUSY 仍切号（找空闲身份）",
+    )
+    check(auth.should_switch_account(UpstreamAPIError(401, "f", {})) is True, "K3-b AUTH 仍切号")
+    check(auth.should_switch_account(UpstreamAPIError(403, "f", {})) is True, "K3-c RISK 仍切号")
+    # K4 TRANSIENT 不计风控
+    check(auth.classify_upstream_error(UpstreamAPIError(404, "x", {})) == "TRANSIENT", "K4-a 404 分类为 TRANSIENT")
+    check(auth.classify_risk_event(UpstreamAPIError(404, "x", {})) is False, "K4-b 404 不计风控")
+    check(auth.classify_risk_event(UpstreamAPIError(500, "x", {})) is False, "K4-c 500 不计风控")
+    # K5 401 权威标记判定
+    check(auth.classify_upstream_error(UpstreamAPIError(401, "f", {})) == "AUTH", "K5-a 401 分类为 AUTH")
+    check(auth.is_authoritative_auth_failure(UpstreamAPIError(401, "f", {})) is False, "K5-b 401 无标记 → 非权威失效")
+    check(auth.classify_risk_event(UpstreamAPIError(401, "f", {})) is False, "K5-c 401 无标记不计风控（不冷却）")
+    check(
+        auth.is_authoritative_auth_failure(UpstreamAPIError(401, "x", {"code": 401, "message": "x"})) is True,
+        "K5-d 401 body code=401 → 权威失效",
+    )
+    check(
+        auth.classify_risk_event(UpstreamAPIError(401, "登录状态失效", {"message": "登录状态失效"})) is True,
+        "K5-e 401 失效文案计风控",
+    )
+
+    # K6 failover 消费：404 不切号 —— 异常上抛、账号不前进、身份不变、不冷却
+    seen: list[int] = []
+
+    def op404(i: int, tk: str):
+        seen.append(i)
+        raise UpstreamAPIError(404, "not found", {})
+
+    raised: Exception | None = None
+    try:
+        client._call_with_account_failover("k404", op404, preferred_account_index=0)
+    except UpstreamAPIError as exc:
+        raised = exc
+    check(raised is not None and raised.status_code == 404, "K6-a 404 显式上抛（失败不伪装成成功）", str(raised))
+    check(seen == [0], "K6-b 404 只尝试起始账号，不切号", f"seen={seen}")
+    check(auth.get_current_account_index() == 0, "K6-c 轮换游标未前进")
+    check(auth.get_device_id_for_account(0) == dev_before, "K6-d device_id 未变")
+    check(not auth.is_account_cooling_down(0), "K6-e 404 不进风控冷却")
+
+    # K7 failover 消费：401 无权威标记 → 切号继续服务，但不冷却不换身份（走通用熔断）
+    def op401_plain(i: int, tk: str):
+        if i == 0:
+            raise UpstreamAPIError(401, "f", {})
+        return ("ok", i)
+
+    result = client._call_with_account_failover("k401", op401_plain, preferred_account_index=0)
+    check(result == ("ok", 1), "K7-a 401 切号到下一账号继续服务", str(result))
+    check(not auth.is_account_cooling_down(0), "K7-b 401 无标记不进冷却（P0-1 核心）")
+    check(auth.get_device_id_for_account(0) == dev_before, "K7-c 401 无标记不换 device_id")
+
+    # K8 401 权威失效标记 → 计风控：三连 → 冷却 + 换身份
+    # （先清掉 K6/K7 累积的通用熔断计数，避免熔断先于风控阈值把账号摘出轮换）
+    auth._accounts[0].consecutive_failures = 0
+    auth._accounts[0].breaker_until = 0.0
+
+    def op401_dead(i: int, tk: str):
+        raise UpstreamAPIError(401, "token 已失效", {"code": 401, "message": "token 已失效"})
+
+    for _ in range(3):
+        try:
+            client._call_with_account_failover("k401dead", op401_dead, preferred_account_index=0)
+        except Exception:
+            pass
+    check(auth.is_account_cooling_down(0), "K8-a 401 权威失效三连 → 冷却")
+    check(auth.get_device_id_for_account(0) != dev_before, "K8-b 冷却触发 device_id 安全阀轮换")
+
+
 def main() -> int:
     os.environ.pop("GLM_TOKEN_FILE", None)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
@@ -579,6 +677,7 @@ def main() -> int:
         check_d4(mgr)
         check_d1(tmp, _deid)
         check_d3(tmp)
+        check_p01(tmp)
         check_runtime(tmp)
         check_p2(tmp)
         check_p6(tmp)

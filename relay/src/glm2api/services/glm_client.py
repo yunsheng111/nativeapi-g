@@ -1023,13 +1023,17 @@ class GLMWebClient:
                         except Exception as exc:
                             last_exc = exc
                             self.auth.record_result(account_index, False, str(exc))
+                            # P0-1 分类先行：风控判定（401 需权威标记）与切号判定
+                            # （TRANSIENT 不切号）都由 auth 按分类给出。
                             is_risk = self.auth.classify_risk_event(exc)
                             if is_risk:
                                 self.auth.register_risk_event(account_index, exc)
                             should_switch = self.auth.should_switch_account(exc)
                             if should_switch:
                                 self.auth.invalidate_account(account_index)
-                            if should_switch and attempt < guest_retry_limit:
+                            # 游客身份获取是无状态动作，任何分类的失败都可重取
+                            # （含 TRANSIENT 网络抖动 —— 切号语义变了，重取韧性不变）
+                            if attempt < guest_retry_limit:
                                 backoff = self.auth.next_risk_backoff(attempt) if is_risk else 0.0
                                 self.logger.warning(
                                     "游客账号请求失败，重新获取游客 ck 重试 attempt=%s/%s backoff=%.1fs request=%s account=%s error=%s",
