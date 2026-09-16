@@ -62,6 +62,27 @@ _DUMP_JS = """
 """
 
 
+def _capture_chatglm_cookies(client) -> list[dict]:
+    """抓取浏览器里 chatglm.cn 域的全部 cookie（P2.5 第二批 D2）。
+
+    用途：BrowserContext 账号隔离池创建专属 context 时灌入，让该账号的
+    同源 fetch 带上自己的 cookie（cookie 与 Authorization 同源一致，消除
+    身份混叠）。抓取放在登录导入时一次性完成；Storage.getCookies 无需
+    enable，失败降级为无 cookie（context 干净身份仍成立）。
+
+    落盘位置：accounts.json 的条目 extra.cookies —— 该文件本就存同级敏感
+    的 refresh_token，且已在凭据 ignore 清单内。
+    """
+    try:
+        result = client.call("Storage.getCookies", {}, timeout=8.0)
+    except Exception:  # noqa: BLE001  CDPError/断连都降级为无 cookie
+        return []
+    cookies = result.get("cookies") if isinstance(result, dict) else None
+    if not isinstance(cookies, list):
+        return []
+    return [c for c in cookies if isinstance(c, dict) and "chatglm" in str(c.get("domain", ""))]
+
+
 @dataclass
 class Capture:
     """一次成功抓取。"""
@@ -309,6 +330,13 @@ class LoginImportSession:
         if not self._snapshot_done:
             self._write_snapshot(items, page_url, token_key, device_key)
 
+        # P2.5 第二批 D2：登录态 cookie 一并抓取，供 BrowserContext 池灌入
+        cookies: list[dict] = []
+        with self._lock:
+            client = self._client
+        if client is not None:
+            cookies = _capture_chatglm_cookies(client)
+
         if self.store.has_token(token):
             with self._lock:
                 if "已登录账号已导入" not in self.message and not self.captures:
@@ -324,7 +352,12 @@ class LoginImportSession:
             device_id=device_id,
             source="browser-login",
             label=f"登录导入 {now_iso()}",
-            extra={"token_key": token_key, "device_key": device_key, "page_url": page_url},
+            extra={
+                "token_key": token_key,
+                "device_key": device_key,
+                "page_url": page_url,
+                "cookies": cookies,
+            },
         )
         tokens = self.store.load_tokens()
         cap = Capture(

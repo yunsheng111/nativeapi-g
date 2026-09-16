@@ -218,6 +218,103 @@ def test_config_and_variants() -> None:
     check(not any(m.endswith("-cdp") for m in expanded), "F12-e /models 变体列表不自动展开 -cdp")
 
 
+def test_context_pool() -> None:
+    """P2.5 第二批 D2：BrowserContext 账号隔离池的离线可测面（不启动浏览器）。"""
+    from glmrelay.browser.cdp_fetch import CdpFetchTransport, map_cookie_for_context
+    from glm2api.core import transport
+
+    # CF cookie 映射
+    mapped = map_cookie_for_context(
+        {"name": "chatglm_user", "value": "v1", "domain": ".chatglm.cn", "path": "/",
+         "expires": 1234.5, "httpOnly": True, "secure": True, "sameSite": "lax", "extra": "drop"}
+    )
+    check(mapped == {"name": "chatglm_user", "value": "v1", "domain": ".chatglm.cn", "path": "/",
+                     "expires": 1234.5, "httpOnly": True, "secure": True, "sameSite": "Lax"},
+          "CF-a cookie 映射完整且剥离未知键", str(mapped))
+    check(map_cookie_for_context({"value": "v"}) is None, "CF-b 缺 name 的 cookie 丢弃")
+    check(map_cookie_for_context({"name": "n", "sameSite": "STRICT"})["sameSite"] == "Strict",
+          "CF-c sameSite 大小写归一")
+
+    transport.set_request_account(None)
+    try:
+        # 无账号提示 → 默认槽（浏览器默认身份，P2.5 第一批形态）
+        pool = CdpFetchTransport("_unused_profile", account_contexts=True)
+        slot = pool._slot_for_request()
+        check(slot.key == "default" and slot.browser_context is False, "CP-a 无提示 → 默认槽")
+
+        # 游客 → 默认槽；非游客 → 专属槽；同账号复用同一槽
+        pool2 = CdpFetchTransport(
+            "_unused_profile", account_contexts=True,
+            guest_resolver=lambda i: i == 0,
+        )
+        guest_slot = pool2._slot_for_request()
+        transport.set_request_account(0)
+        same = pool2._slot_for_request()
+        check(same.key == "default" and same is guest_slot, "CP-b 游客账号走默认槽")
+        transport.set_request_account(2)
+        real = pool2._slot_for_request()
+        check(real.key == "account-2" and real.browser_context is True, "CP-c 非游客账号懒建专属槽")
+        check(pool2._slot_for_request() is real, "CP-d 同账号复用同一槽（不重复建）")
+        transport.set_request_account(3)
+        other = pool2._slot_for_request()
+        check(other is not real and other.binding_name != real.binding_name, "CP-e 不同账号槽隔离且 binding 名独立")
+
+        # 隔离池关闭 → 全部走默认槽
+        pool3 = CdpFetchTransport("_unused_profile", account_contexts=False, guest_resolver=lambda i: False)
+        transport.set_request_account(1)
+        check(pool3._slot_for_request().key == "default", "CP-f account_contexts=false 退回单槽旧形态")
+    finally:
+        transport.set_request_account(None)
+
+    # cookie_resolver 槽位装配（只查方法存在与绑定，不触发浏览器）
+    pool4 = CdpFetchTransport("_unused_profile", cookie_resolver=lambda i: [{"name": "k", "value": "v"}])
+    check(pool4.cookie_resolver(0) == [{"name": "k", "value": "v"}], "CP-g cookie_resolver 注入可用")
+
+
+def test_canary() -> None:
+    """P2.5 第二批：canary 传输通道调度（11.4）离线断言。"""
+    from glmrelay.browser.cdp_fetch import TransportCanary
+
+    # 默认关闭：pick 不改选路，只记录统计
+    off = TransportCanary(enabled=False, default_channel="urllib")
+    check(off.pick("urllib") == "urllib", "CY-a 关闭时默认通道不变")
+    check(off.pick("cdp") == "cdp", "CY-b 关闭时显式 cdp 不变")
+    off.record("cdp", True)
+    off.record("urllib", False)
+    stats = off.stats()
+    check(stats["channels"]["cdp"]["requests"] == 1 and stats["channels"]["urllib"]["failures"] == 1,
+          "CY-c 关闭时统计仍记录（transport 记录前置）", str(stats["channels"]))
+
+    # 开启：主力走稳定通道，每 N 次放一次 canary
+    canary = TransportCanary(enabled=True, default_channel="urllib", every_n=3, failure_threshold=2, cooldown_seconds=600.0)
+    picks = [canary.pick("urllib") for _ in range(2)]
+    check(all(p == "urllib" for p in picks), "CY-d N 次内全走稳定通道", str(picks))
+    check(canary.pick("urllib") == "cdp", "CY-e 每 N 次放一次 canary 探针")
+    check(canary.pick("urllib") == "urllib", "CY-f canary 后回稳定通道")
+
+    # 显式覆盖不参与分流
+    check(canary.pick("cdp", explicit=True) == "cdp", "CY-g 显式覆盖直通")
+    check(canary.pick("urllib", explicit=True) == "urllib", "CY-h 显式 urllib 直通")
+
+    # 连败淘汰 + 冷却
+    for _ in range(2):
+        canary.record("cdp", False)
+    stats = canary.stats()
+    check(stats["channels"]["cdp"]["consecutive_failures"] == 0 and stats["channels"]["cdp"]["failures"] == 2,
+          "CY-i 连败达阈值后计数清零（进入冷却）", str(stats["channels"]["cdp"]))
+    picks = [canary.pick("urllib") for _ in range(6)]
+    check(all(p == "urllib" for p in picks), "CY-j 冷却期不再放 canary", str(picks))
+
+    # 连胜升级建议（翻转判据给数据，不自动翻转）
+    promote = TransportCanary(enabled=True, default_channel="urllib", every_n=1, failure_threshold=5, promote_after=3)
+    check(promote.pick("urllib") == "cdp", "CY-k every_n=1 每次都放 canary")
+    promote.record("cdp", True)
+    promote.record("cdp", True)
+    check(promote._promote_announced is False, "CY-l 升级阈值前不触发建议")
+    promote.record("cdp", True)
+    check(promote._promote_announced is True, "CY-m 连胜达阈值触发翻转建议（不自动改配置）")
+
+
 def main() -> int:
     test_stream_flow()
     test_error_semantics()
@@ -225,6 +322,8 @@ def main() -> int:
     test_headers_and_bridge()
     test_breaker_and_hint()
     test_config_and_variants()
+    test_context_pool()
+    test_canary()
     print(f"\nPASS {len(PASS)} / FAIL {len(FAIL)}")
     for name in FAIL:
         print(f"  FAILED: {name}")

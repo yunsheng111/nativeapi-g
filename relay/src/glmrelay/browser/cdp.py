@@ -166,6 +166,44 @@ def find_page_target(
     raise CDPError(f"未找到匹配 {url_contains!r} 的页面{detail}")
 
 
+def find_browser_target(port: int = DEFAULT_DEBUG_PORT) -> dict:
+    """browser 级调试目标（/json/version 的 ws）。
+
+    Target.createBrowserContext / disposeBrowserContext / closeTarget 等
+    Target 域操作只能在 browser 级会话上调用 —— 连 page target 的会话会报
+    "Target domain is not supported on this target"。
+    """
+    data = wait_for_devtools(port)
+    ws_url = data.get("webSocketDebuggerUrl")
+    if not ws_url:
+        raise CDPError("浏览器调试端点未返回 webSocketDebuggerUrl")
+    return {
+        "type": "browser",
+        "id": data.get("Browser", "browser"),
+        "webSocketDebuggerUrl": normalize_ws_url(str(ws_url), port),
+    }
+
+
+def find_target_by_id(port: int, target_id: str, timeout: float = 20.0) -> dict:
+    """按 targetId 查找调试目标。
+
+    Target.createTarget 刚创建的 page target 不会立刻出现在 /json/list
+    （目标在创建中），必须轮询等待；这是 BrowserContext 池把新 tab 接入
+    双连接的唯一入口。
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        for target in list_targets(port):
+            if target.get("id") == target_id and target.get("webSocketDebuggerUrl"):
+                target = dict(target)
+                target["webSocketDebuggerUrl"] = normalize_ws_url(
+                    str(target["webSocketDebuggerUrl"]), port
+                )
+                return target
+        time.sleep(0.2)
+    raise CDPError(f"调试目标 {target_id} 在 {timeout:.0f}s 内未出现")
+
+
 # --------------------------------------------------------------------- 启动浏览器
 
 
@@ -478,7 +516,9 @@ __all__ = [
     "ManagedBrowser",
     "DEFAULT_DEBUG_PORT",
     "find_browser",
+    "find_browser_target",
     "find_page_target",
+    "find_target_by_id",
     "launch_browser",
     "list_targets",
     "normalize_ws_url",
