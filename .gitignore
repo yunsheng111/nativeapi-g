@@ -26,3 +26,8 @@ relay/_cdp_profile_*/
 
 # 会话工具本地记忆目录
 .workbuddy-ai/
+
+# P0-11 仓库卫生（turb-register 教训：抓包产物往往绕过既有规则）
+*.har
+*capture*.jsonl
+Default-*.json
