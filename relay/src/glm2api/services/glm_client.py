@@ -53,10 +53,18 @@ IMAGE_SIZE_TO_ASPECT_RATIO = {
 
 
 class UpstreamAPIError(RuntimeError):
-    def __init__(self, status_code: int, message: str, payload: dict[str, object] | None = None) -> None:
+    def __init__(
+        self,
+        status_code: int,
+        message: str,
+        payload: dict[str, object] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.payload = payload or {}
+        # P0-2：保留响应头（Retry-After 等退避信号），异常穿透 failover 时仍可读
+        self.headers = headers
 
 
 class QueueTimeoutError(RuntimeError):
@@ -498,7 +506,7 @@ class GLMWebClient:
                         continue
 
                     message = self._build_error_message(exc.code, error_payload)
-                    raise UpstreamAPIError(status_code=exc.code, message=message, payload=error_payload) from exc
+                    raise UpstreamAPIError(status_code=exc.code, message=message, payload=error_payload, headers=dict(exc.headers)) from exc
 
             raise UpstreamAPIError(status_code=429, message="GLM 长时间忙碌，请稍后重试。")
 
@@ -588,7 +596,7 @@ class GLMWebClient:
             except urllib.error.HTTPError as exc:
                 error_payload = self._read_error_payload(exc)
                 message = self._build_error_message(exc.code, error_payload)
-                raise UpstreamAPIError(status_code=exc.code, message=message, payload=error_payload) from exc
+                raise UpstreamAPIError(status_code=exc.code, message=message, payload=error_payload, headers=dict(exc.headers)) from exc
 
         response = self._call_with_account_failover(
             f"image:{user_model}",
@@ -1034,7 +1042,12 @@ class GLMWebClient:
                             # 游客身份获取是无状态动作，任何分类的失败都可重取
                             # （含 TRANSIENT 网络抖动 —— 切号语义变了，重取韧性不变）
                             if attempt < guest_retry_limit:
-                                backoff = self.auth.next_risk_backoff(attempt) if is_risk else 0.0
+                                if is_risk:
+                                    # P0-2：风控退避合并上游明示的 Retry-After
+                                    backoff = self.auth.next_risk_backoff(attempt, self.auth.parse_retry_after(exc))
+                                else:
+                                    ra = self.auth.parse_retry_after(exc)
+                                    backoff = ra if ra is not None else 0.0
                                 self.logger.warning(
                                     "游客账号请求失败，重新获取游客 ck 重试 attempt=%s/%s backoff=%.1fs request=%s account=%s error=%s",
                                     attempt + 1,

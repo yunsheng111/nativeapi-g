@@ -4,6 +4,7 @@ import hashlib
 import gzip
 import json
 import random
+import re
 import threading
 import time
 import uuid
@@ -51,6 +52,22 @@ AUTH_INVALIDATION_MARKERS = (
     "invalid token",
     "token invalid",
 )
+
+# P0-2 Retry-After 解析（生态调研 A5/P0-3）：上游明示"请等 N"时尊重它。
+# 上游是中文站，错误文案里中英单位混用（"5 分钟" / "5 minutes"），只认英文会漏。
+# retry_after=0 用 is not None 判断（`if retry_after:` 会把"立即重试"吞成"无信息"）。
+RETRY_AFTER_PATTERN = re.compile(
+    r"(\d+)\s*(hours?|hrs?|minutes?|mins?|seconds?|secs?|小时|分钟|分|秒钟|秒|天|d|h|m|s)",
+    re.IGNORECASE,
+)
+RETRY_AFTER_UNIT_SECONDS = {
+    "h": 3600.0, "hr": 3600.0, "hrs": 3600.0, "hour": 3600.0, "hours": 3600.0, "小时": 3600.0,
+    "m": 60.0, "min": 60.0, "mins": 60.0, "minute": 60.0, "minutes": 60.0, "分钟": 60.0, "分": 60.0,
+    "s": 1.0, "sec": 1.0, "secs": 1.0, "second": 1.0, "seconds": 1.0, "秒": 1.0, "秒钟": 1.0,
+    "d": 86400.0, "day": 86400.0, "days": 86400.0, "天": 86400.0,
+}
+# 无总体重试预算可裁剪（游客重取循环无 deadline），用硬上限兜底防止退避失控
+RETRY_AFTER_MAX_SECONDS = 600.0
 
 
 def build_sign() -> tuple[str, str, str]:
@@ -578,9 +595,60 @@ class GLMAccessTokenManager:
                 )
             return rows
 
-    def next_risk_backoff(self, attempt: int) -> float:
-        """风控类异常的同账号重试退避：min(60, 2^n) 秒 + 半程抖动。"""
+    def parse_retry_after(self, exc: Exception) -> float | None:
+        """从异常中解析上游明示的等待时长（P0-2）。返回秒数；无法解析返回 None。
+
+        优先级：HTTP 头 Retry-After（纯秒数）> payload retry_after 字段 >
+        错误文案正则（中英双语，支持"1小时30分钟"叠加）。
+        """
+        headers = getattr(exc, "headers", None)
+        if headers is not None:
+            try:
+                value = headers.get("Retry-After")
+            except Exception:
+                value = None
+            if value is not None:
+                text = str(value).strip()
+                try:
+                    return float(text)
+                except ValueError:
+                    pass
+        payload = getattr(exc, "payload", None)
+        if isinstance(payload, dict) and payload.get("retry_after") is not None:
+            try:
+                return float(payload["retry_after"])
+            except (TypeError, ValueError):
+                pass
+        if isinstance(payload, dict):
+            texts = [str(payload.get("message", ""))]
+        else:
+            texts = []
+        texts.append(str(exc))
+        for text in texts:
+            total = 0.0
+            matched = False
+            for match in RETRY_AFTER_PATTERN.finditer(text):
+                unit = match.group(2).lower()
+                factor = RETRY_AFTER_UNIT_SECONDS.get(unit)
+                if factor is None:
+                    continue
+                total += float(match.group(1)) * factor
+                matched = True
+            if matched:
+                return total
+        return None
+
+    def next_risk_backoff(self, attempt: int, retry_after: float | None = None) -> float:
+        """风控类异常的同账号重试退避：min(60, 2^n) 秒 + 半程抖动（P0-2 扩展）。
+
+        上游明示 Retry-After 时取 max(指数退避, retry_after) 并裁剪到上限；
+        retry_after=0 视为"立即可重试"，不得被 falsy 判断吞掉。
+        """
         base = min(60.0, 2.0 ** max(0, attempt))
+        if retry_after is not None:
+            if retry_after <= 0:
+                return 0.0
+            return min(max(base, retry_after), RETRY_AFTER_MAX_SECONDS)
         return base + random.uniform(0, base * 0.5)
 
     def apply_guest_stagger(self, account_index: int) -> None:

@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 import logging
 import os
@@ -658,6 +659,43 @@ def check_p01(tmp: Path) -> None:
     check(auth.get_device_id_for_account(0) != dev_before, "K8-b 冷却触发 device_id 安全阀轮换")
 
 
+# --------------------------------------------------------------- P2.6 P0-2 Retry-After
+
+def check_p02(tmp: Path) -> None:
+    import urllib.error as ue
+    from glm2api.config import load_config
+    from glm2api.services.glm_client import GLMWebClient, UpstreamAPIError
+    from glm2api.services.glm_auth import RETRY_AFTER_MAX_SECONDS
+
+    logger = logging.getLogger("check_p02")
+    cfg = load_config(str(tmp / ".env"))
+    client = GLMWebClient(cfg, logger)
+    auth = client.auth
+
+    # RA1 HTTP 头形态：纯秒数；0 必须存活（不得被 falsy 吞掉）
+    check(auth.parse_retry_after(UpstreamAPIError(429, "x", {}, {"Retry-After": "0"})) == 0.0, "RA1-a Retry-After: 0 → 0.0（is not None 语义）")
+    check(auth.parse_retry_after(UpstreamAPIError(429, "x", {}, {"Retry-After": "120"})) == 120.0, "RA1-b Retry-After: 120 → 120s")
+    # RA2 中文文案形态（本项目上游是中文站，直接对口）
+    check(auth.parse_retry_after(UpstreamAPIError(429, "请 5 分钟 后重试", {})) == 300.0, "RA2-a 『5 分钟』→ 300s")
+    check(auth.parse_retry_after(UpstreamAPIError(429, "请等待 30秒 后重试", {})) == 30.0, "RA2-b 『30秒』→ 30s")
+    check(auth.parse_retry_after(UpstreamAPIError(429, "冷却 1小时30分钟", {})) == 5400.0, "RA2-c 『1小时30分钟』叠加 → 5400s")
+    # RA3 英文文案形态（对照 gptGrok B pool.go 双语正则）
+    check(auth.parse_retry_after(UpstreamAPIError(429, "retry after 2 minutes", {})) == 120.0, "RA3-a 『2 minutes』→ 120s")
+    check(auth.parse_retry_after(UpstreamAPIError(429, "come back in 30s", {})) == 30.0, "RA3-b 『30s』→ 30s")
+    check(auth.parse_retry_after(ue.HTTPError("u", 429, "wait 5 minutes", {"Content-Type": "text/plain"}, io.BytesIO(b""))) == 300.0, "RA3-c 裸 HTTPError 无头 → 文案 300s")
+    # RA4 无信息 → None（走原指数退避）
+    check(auth.parse_retry_after(UpstreamAPIError(429, "too many", {})) is None, "RA4-a 无头无文案 → None")
+    check(auth.parse_retry_after(RuntimeError("普通错误")) is None, "RA4-b 普通异常 → None")
+    # RA5 退避合并：0 → 立即重试；大值取大；无值原公式
+    check(auth.next_risk_backoff(0, 0.0) == 0.0, "RA5-a retry_after=0 → 立即重试")
+    check(auth.next_risk_backoff(0, 300.0) == 300.0, "RA5-b max(指数, 300) → 300s")
+    got = auth.next_risk_backoff(6)
+    check(60.0 <= got <= 90.0, "RA5-c 无 Retry-After → 原指数公式不变", f"{got}")
+    check(auth.next_risk_backoff(6, 7200.0) == RETRY_AFTER_MAX_SECONDS, "RA5-d 超限裁剪到上限", f"{RETRY_AFTER_MAX_SECONDS}")
+    # RA6 端到端：payload 携带 retry_after 字段也可解析
+    check(auth.parse_retry_after(UpstreamAPIError(429, "x", {"retry_after": 45})) == 45.0, "RA6 payload retry_after 字段")
+
+
 def main() -> int:
     os.environ.pop("GLM_TOKEN_FILE", None)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
@@ -678,6 +716,7 @@ def main() -> int:
         check_d1(tmp, _deid)
         check_d3(tmp)
         check_p01(tmp)
+        check_p02(tmp)
         check_runtime(tmp)
         check_p2(tmp)
         check_p6(tmp)
