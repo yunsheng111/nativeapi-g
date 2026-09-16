@@ -794,6 +794,82 @@ def check_p03(tmp: Path) -> None:
     )
 
 
+# --------------------------------------------------------------- P2.6 P0-4 上下文长度保护
+
+def check_p04(tmp: Path) -> None:
+    from glm2api.services.translator import convert_messages
+
+    def tc(cid: str, name: str = "t"):
+        return {"role": "assistant", "content": "", "tool_calls": [
+            {"id": cid, "type": "function", "function": {"name": name, "arguments": "{}"}}
+        ]}
+
+    big_text = "长" * 2000  # 中文 1 字 ≈ 1 token，每轮问题 ≈ 2000 tokens
+    msgs = [
+        {"role": "system", "content": "你是测试助手"},
+        {"role": "user", "content": f"第一轮问题 {big_text}"},
+        tc("call_x1"),
+        {"role": "tool", "tool_call_id": "call_x1", "content": "第一轮工具结果"},
+        {"role": "assistant", "content": "第一轮回答"},
+        {"role": "user", "content": f"第二轮问题 {big_text}"},
+        tc("call_x2"),
+        {"role": "tool", "tool_call_id": "call_x2", "content": "第二轮工具结果"},
+        {"role": "assistant", "content": "第二轮回答"},
+        {"role": "user", "content": "最新问题"},
+    ]
+
+    # CX1 关闭（默认 0=关闭）与旧行为逐字节一致
+    check(
+        convert_messages(msgs, None, context_max_tokens=0) == convert_messages(msgs, None),
+        "CX1 context_max_tokens=0 与默认行为逐字节一致（可关闭性）",
+    )
+
+    # CX2 超预算 → 成对裁剪：整轮丢弃（问题 + tool_calls + 结果一起走/一起留）
+    logs = LogCapture()
+    tr_logger = logging.getLogger("glm2api.services.translator")
+    tr_logger.addHandler(logs)
+    try:
+        out = convert_messages(msgs, None, context_max_tokens=3000)
+    finally:
+        tr_logger.removeHandler(logs)
+    flat = json.dumps(out, ensure_ascii=False)
+    check("最新问题" in flat, "CX2-a 当前问题始终保留")
+    check("你是测试助手" in flat, "CX2-b 开头 system 消息不被裁掉")
+    check(
+        "第一轮问题" not in flat and "第一轮工具结果" not in flat and "call_x1" not in flat,
+        "CX2-c 最旧一轮被成对丢弃（不留孤立 tool_calls / 结果）",
+    )
+    check(
+        "第二轮问题" in flat and "第二轮工具结果" in flat and "call_x2" in flat,
+        "CX2-d 保留轮次完整成对",
+    )
+    check(
+        any("已裁剪" in m for m in logs.messages),
+        "CX2-e 裁剪显式告警（失败/降级不静默）",
+        f"logs={logs.messages[:3]}",
+    )
+
+    # CX3 预算小到连 system+最新问题都放不下 → 兜底最大有效切点，仍保持配对与 system
+    logs3 = LogCapture()
+    tr_logger.addHandler(logs3)
+    try:
+        out3 = convert_messages(msgs, None, context_max_tokens=5)
+    finally:
+        tr_logger.removeHandler(logs3)
+    flat3 = json.dumps(out3, ensure_ascii=False)
+    check(
+        "最新问题" in flat3 and "你是测试助手" in flat3 and "call_x2" not in flat3,
+        "CX3 极小预算兜底：保留 system + 最新问题且不成对破坏",
+    )
+    check(any("仍超预算" in m for m in logs3.messages), "CX3-b 兜底仍超预算时显式告警", f"logs={logs3.messages[:3]}")
+
+    # CX4 未超预算时输出与关闭态一致（零扰动）
+    check(
+        convert_messages(msgs, None, context_max_tokens=999999) == convert_messages(msgs, None),
+        "CX4 预算充足时与关闭态逐字节一致",
+    )
+
+
 def main() -> int:
     os.environ.pop("GLM_TOKEN_FILE", None)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
@@ -816,6 +892,7 @@ def main() -> int:
         check_p01(tmp)
         check_p02(tmp)
         check_p03(tmp)
+        check_p04(tmp)
         check_runtime(tmp)
         check_p2(tmp)
         check_p6(tmp)

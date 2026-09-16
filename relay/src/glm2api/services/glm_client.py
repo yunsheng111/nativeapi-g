@@ -414,6 +414,7 @@ class GLMWebClient:
             tool_choice=openai_payload.get("tool_choice"),
             server_side_tool_names=SERVER_SIDE_TOOL_NAMES,
             tool_result_max_chars=self.config.glm_tool_result_max_chars,
+            context_max_tokens=self.config.glm_context_max_tokens,
         )
         debug_dump(self.logger, self.config.debug_dump_all, "OpenAI 原始 chat 请求 payload", openai_payload)
         debug_dump(self.logger, self.config.debug_dump_all, "转换后的 GLM messages", converted_messages)

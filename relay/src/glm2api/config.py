@@ -164,6 +164,7 @@ class AppConfig:
     glm_cdp_breaker_threshold: int
     glm_cdp_breaker_seconds: float
     glm_tool_result_max_chars: int
+    glm_context_max_tokens: int
     blocked_tool_names: list[str]
     exposed_models: list[str]
     model_aliases: dict[str, str]
@@ -298,6 +299,8 @@ def load_config(env_file: str = ".env") -> AppConfig:
         glm_cdp_breaker_threshold=max(1, parse_int(values.get("GLM_CDP_BREAKER_THRESHOLD"), 3)),
         glm_cdp_breaker_seconds=max(1.0, parse_float(values.get("GLM_CDP_BREAKER_SECONDS"), 600.0)),
         glm_tool_result_max_chars=max(0, parse_int(values.get("GLM_TOOL_RESULT_MAX_CHARS"), 24000)),
+        # P0-4 上下文长度保护（拍板点 2）：默认 0 = 关闭，先观测真实拍平体积分布再定默认值
+        glm_context_max_tokens=max(0, parse_int(values.get("GLM_CONTEXT_MAX_TOKENS"), 0)),
         blocked_tool_names=parse_list(values.get("BLOCKED_TOOL_NAMES"), DEFAULT_BLOCKED_TOOL_NAMES),
         exposed_models=exposed_models,  # type: ignore
         model_aliases=model_aliases,

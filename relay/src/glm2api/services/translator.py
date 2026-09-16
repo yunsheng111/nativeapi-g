@@ -10,7 +10,7 @@ from logging import Logger
 
 from ..config import AppConfig
 from ..core.openai_compat import gen_chatcmpl_id, system_fingerprint
-from ..core.tokenizer import estimate_completion_tokens
+from ..core.tokenizer import count_tokens, estimate_completion_tokens
 from ..logging_utils import debug_dump
 from ..model_variants import model_requests_search, model_requests_thinking, split_model_features
 from ..utils.tool_parser import StreamingToolParser, parse_tool_calls_from_text
@@ -32,6 +32,97 @@ ASSISTANT_ID_PATTERN = re.compile(r"^[a-z0-9]{24,}$")
 URL_PATTERN = re.compile(r"https?://[^\s<>()\"']+")
 POWERSHELL_CMDLET_PATTERN = re.compile(r"^[A-Z][A-Za-z]+-[A-Z][A-Za-z]+$")
 POWERSHELL_ALIASES = {"cat", "cd", "copy", "del", "dir", "echo", "erase", "ls", "md", "move", "pwd", "rd", "ren", "rm", "sc", "type"}
+
+logger = logging.getLogger(__name__)
+
+
+# P0-4 上下文长度保护：拍平历史时按 token 预算做"成对裁剪"。processed 条目的
+# 结构类别 —— assistant_toolcalls / tool_result / plain。裁剪必须保持配对完整
+# （不留孤立的 assistant tool_calls 或工具结果，否则上游视角的对话结构被破坏）。
+_KIND_TOOLCALLS = "assistant_toolcalls"
+_KIND_TOOLRESULT = "tool_result"
+_KIND_PLAIN = "plain"
+
+
+def _estimate_items_tokens(items: list[dict[str, str]]) -> int:
+    if not items:
+        return 0
+    joined = "\n\n".join(f"{item['role']}: {item['content']}" for item in items)
+    return count_tokens(joined)
+
+
+def _remainder_pairing_valid(items: list[dict[str, str]], kinds: list[str]) -> bool:
+    """裁剪后片段的配对校验：每个 tool_result 之前必须还有同轮的 assistant tool_calls。"""
+    expect_calls = False
+    for kind in kinds:
+        if kind == _KIND_TOOLRESULT:
+            if not expect_calls:
+                return False
+        else:
+            expect_calls = kind == _KIND_TOOLCALLS
+    return True
+
+
+def _trim_history_to_budget(
+    processed: list[dict[str, str]],
+    item_kinds: list[str],
+    budget: int,
+    preamble_text: str,
+) -> tuple[list[dict[str, str]], list[str], bool]:
+    """按 token 预算从最旧的一轮开始裁剪历史，返回 (条目, 类别, 是否裁剪)。
+
+    约束：开头连续的 system 消息始终保留；候选切点 = 真实 user 消息的起点
+    （非工具结果改标）；切点后片段必须通过配对校验；升序取第一个放得下的
+    切点（保留最多历史）。全部超预算时退到最大有效切点并显式告警。
+    """
+    if budget <= 0 or not processed:
+        return processed, item_kinds, False
+    fixed = count_tokens(preamble_text) + count_tokens("\n\nAssistant: ") + 8
+
+    def total(items: list[dict[str, str]]) -> int:
+        return fixed + _estimate_items_tokens(items)
+
+    before_tokens = total(processed)
+    if before_tokens <= budget:
+        return processed, item_kinds, False
+
+    leading_sys = 0
+    while leading_sys < len(processed) and processed[leading_sys]["role"] == "system":
+        leading_sys += 1
+    prefix, prefix_kinds = processed[:leading_sys], item_kinds[:leading_sys]
+
+    chosen: int | None = None
+    last_valid: int | None = None
+    for cut in range(leading_sys, len(processed)):
+        if not (processed[cut]["role"] == "user" and item_kinds[cut] == _KIND_PLAIN):
+            continue
+        kept, kept_kinds = prefix + processed[cut:], prefix_kinds + item_kinds[cut:]
+        if not _remainder_pairing_valid(kept, kept_kinds):
+            continue
+        last_valid = cut
+        if chosen is None and total(kept) <= budget:
+            chosen = cut
+            break
+    if chosen is None:
+        if last_valid is None:
+            # 无可裁剪点（无历史 user 起点）—— 明说，不静默硬塞
+            logger.warning(
+                "上下文超预算但无可安全裁剪点 tokens≈%s budget=%s，按原样发送",
+                before_tokens, budget,
+            )
+            return processed, item_kinds, False
+        kept, kept_kinds = prefix + processed[last_valid:], prefix_kinds + item_kinds[last_valid:]
+        logger.warning(
+            "上下文裁剪后仍超预算：丢弃最旧 %s 条（成对保留），tokens %s → %s / budget %s",
+            last_valid, before_tokens, total(kept), budget,
+        )
+        return kept, kept_kinds, True
+    kept, kept_kinds = prefix + processed[chosen:], prefix_kinds + item_kinds[chosen:]
+    logger.warning(
+        "上下文超预算已裁剪：丢弃最旧 %s 条消息（成对），tokens %s → %s / budget %s",
+        chosen, before_tokens, total(kept), budget,
+    )
+    return kept, kept_kinds, True
 
 
 
@@ -353,6 +444,7 @@ def convert_messages(
     tool_choice: object | None = None,
     server_side_tool_names: set[str] | None = None,
     tool_result_max_chars: int | None = None,
+    context_max_tokens: int | None = None,
 ) -> list[dict[str, object]]:
     tools = filter_tools(tools, blocked_tool_names or set())
     available_tool_names = {
@@ -364,6 +456,7 @@ def convert_messages(
     server_side_tool_names = server_side_tool_names or SERVER_SIDE_TOOL_NAMES
     tool_choice_policy = parse_tool_choice_policy(tool_choice, available_tool_names)
     processed: list[dict[str, str]] = []
+    item_kinds: list[str] = []
     latest_user_url: str | None = extract_recent_user_url(messages)
     valid_tool_call_ids: set[str] = set()
     repaired_tool_call_ids: set[str] = set()
@@ -383,6 +476,7 @@ def convert_messages(
     for idx, message in enumerate(messages):
         role = str(message.get("role", "user"))
         content = message.get("content")
+        item_kind = _KIND_PLAIN
         if role == "user":
             current_text = extract_text_content(content)
             current_url = extract_first_url(current_text)
@@ -416,6 +510,7 @@ def convert_messages(
             if not assistant_text and not block:
                 continue
             content = f"{assistant_text}\n{block}".strip() if assistant_text and block else (assistant_text or block)
+            item_kind = _KIND_TOOLCALLS if block else _KIND_PLAIN
         elif role == "tool":
             tool_call_id = str(message.get("tool_call_id", "")).strip()
             # P2 改造（7.5.3）：id 对齐失败从静默丢弃改为显式报错 —— 静默丢弃会让
@@ -440,24 +535,32 @@ def convert_messages(
                 max_chars=tool_result_max_chars,
                 wrap_notice=idx >= current_round_start >= 0,
             )
+            item_kind = _KIND_TOOLRESULT
         elif role == "assistant" and not content:
             continue
 
         text = extract_text_content(content) if content else ""
         if text:
             processed.append({"role": role, "content": text})
+            item_kinds.append(item_kind)
+
+    # P0-4 上下文长度保护：拍平前按预算成对裁剪（默认关闭，逐字节保持旧行为）
+    preamble_text = ""
+    if tools and tool_choice_policy.get("mode") != "none":
+        preamble_text = tools_to_prompt(
+            tools,
+            blocked_tool_names=blocked_tool_names,
+            tool_choice_policy=tool_choice_policy,
+            server_side_tool_names=server_side_tool_names,
+        )
+    processed, item_kinds, _trimmed = _trim_history_to_budget(
+        processed, item_kinds, int(context_max_tokens or 0), preamble_text,
+    )
 
     transcript_parts: list[str] = []
 
-    if tools and tool_choice_policy.get("mode") != "none":
-        transcript_parts.append(
-            tools_to_prompt(
-                tools,
-                blocked_tool_names=blocked_tool_names,
-                tool_choice_policy=tool_choice_policy,
-                server_side_tool_names=server_side_tool_names,
-            )
-        )
+    if preamble_text:
+        transcript_parts.append(preamble_text)
         transcript_parts.append("# CONVERSATION")
 
     for item in processed:
