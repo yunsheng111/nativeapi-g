@@ -870,6 +870,48 @@ def check_p04(tmp: Path) -> None:
     )
 
 
+# --------------------------------------------------------------- P2.6 P0-5 SSE 首帧预取
+
+def check_p05(tmp: Path) -> None:
+    from glm2api.server import prefetch_stream_first_frame
+
+    # PF1 首帧即异常 → 原样穿透（在发 200 之前，由 do_POST 映射为真实状态码）
+    class UpstreamAPIErrorShim(Exception):
+        pass
+
+    def bad_iter():
+        raise UpstreamAPIErrorShim("upstream 401")
+        yield b""  # pragma: no cover
+
+    raised = None
+    try:
+        prefetch_stream_first_frame(bad_iter())
+    except UpstreamAPIErrorShim as exc:
+        raised = exc
+    check(raised is not None, "PF1 首帧异常在预取时穿透（不再 200+流内错误）", str(raised))
+
+    # PF2 正常流：预取帧 + 余下流按序链式回放
+    def stream():
+        yield b"a"
+        yield b"b"
+        yield b"c"
+
+    got = list(prefetch_stream_first_frame(stream()))
+    check(got == [b"a", b"b", b"c"], "PF2 链式迭代器保序回放", str(got))
+
+    # PF3 空流 → 原样返回（200 + finalize 收尾路径，与旧行为一致）
+    check(list(prefetch_stream_first_frame(iter(()))) == [], "PF3 空流透传")
+
+    # PF4 结构断言：三处 _stream_* 都在 send_response 之前接入预取
+    source = (RELAY_SRC / "glm2api" / "server.py").read_text(encoding="utf-8")
+    wired = source.count("stream_iter = prefetch_stream_first_frame(stream_iter)")
+    check(
+        wired == 3,
+        "PF4 三处流式函数均已接入首帧预取",
+        f"命中 {wired} 处",
+    )
+
+
 def main() -> int:
     os.environ.pop("GLM_TOKEN_FILE", None)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
@@ -893,6 +935,7 @@ def main() -> int:
         check_p02(tmp)
         check_p03(tmp)
         check_p04(tmp)
+        check_p05(tmp)
         check_runtime(tmp)
         check_p2(tmp)
         check_p6(tmp)

@@ -60,6 +60,28 @@ except ImportError:  # glmrelay 未安装时底座仍可独立运行
 _CLIENT_DISCONNECTED = (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, socket.timeout)
 RESPONSES_STREAM_HEARTBEAT_SECONDS = 5.0
 
+
+def prefetch_stream_first_frame(stream_iter):
+    """P0-5 SSE 首帧预取：在发送 200/响应头之前先消费上游流的首帧。
+
+    首帧阶段暴露的失败（上游 4xx/5xx、首个事件即 error、流建立即断）以异常
+    形式穿透到 do_POST 的异常映射表，转成真实 HTTP 状态码 —— 而不是
+    "200 + 流内错误"（客户端与网关都无法重试）。返回链式迭代器，先吐预取帧
+    再吐余下流，三个 _stream_* 的主体逻辑零改动。
+
+    延迟代价：200 响应头等到首帧才发。GLM 连接建立后立即发 meta 事件，
+    实测亚秒级；推理模型的长思考发生在首帧之后，不受影响。
+    """
+    first = next(stream_iter, None)
+    if first is None:
+        return stream_iter
+
+    def chained():
+        yield first
+        yield from stream_iter
+
+    return chained()
+
 # MIME types for static files
 _STATIC_MIME: dict[str, str] = {
     ".js": "application/javascript; charset=utf-8",
@@ -438,6 +460,7 @@ class GLM2APIServer:
             def _stream_anthropic(self, openai_payload: dict[str, object], model: str) -> None:
                 openai_payload["stream"] = True
                 stream_iter = glm_client.stream_chat_completion(openai_payload)
+                stream_iter = prefetch_stream_first_frame(stream_iter)
                 accumulator = AnthropicStreamAccumulator(model=model)
 
                 self.send_response(HTTPStatus.OK)
@@ -493,6 +516,7 @@ class GLM2APIServer:
             def _stream_responses(self, openai_payload: dict[str, object], model: str) -> None:
                 openai_payload["stream"] = True
                 stream_iter = glm_client.stream_chat_completion(openai_payload)
+                stream_iter = prefetch_stream_first_frame(stream_iter)
                 accumulator = ResponsesStreamAccumulator(model=model)
 
                 self.send_response(HTTPStatus.OK)
@@ -566,6 +590,7 @@ class GLM2APIServer:
                 model = str(payload.get("model", "unknown"))
                 logger.info("开始流式响应 model=%s", model)
                 stream_iter = glm_client.stream_chat_completion(payload)
+                stream_iter = prefetch_stream_first_frame(stream_iter)
                 self.send_response(HTTPStatus.OK)
                 self._send_common_headers()
                 self.send_header("Content-Type", "text/event-stream; charset=utf-8")
