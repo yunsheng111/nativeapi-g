@@ -1185,6 +1185,50 @@ def check_p09(tmp: Path) -> None:
     check(bool(added3) and store3.added == ["tokOld"], "ST3 settle=0 保持抓到即入库")
 
 
+# --------------------------------------------------------------- P2.6 P0-10/P0-11
+
+def check_p10(tmp: Path) -> None:
+    from glm2api.utils.tool_protocol import build_tool_call_instructions
+
+    # FL1 required 模式：反例语在场（对照 gptGrok A "Do NOT write any plain-text reply"）
+    required_prompt = build_tool_call_instructions(["get_weather"], tool_choice_policy={"mode": "required", "tool_name": None})
+    check(
+        "Do NOT write any plain-text reply" in required_prompt and "entire response must be the executable tool call block" in required_prompt,
+        "FL1 required 模式含纯文本禁令反例语",
+    )
+    # FL2 specific 模式：同样补反例语
+    specific_prompt = build_tool_call_instructions(["get_weather", "search"], tool_choice_policy={"mode": "specific", "tool_name": "search"})
+    check(
+        "Do NOT write any plain-text reply" in specific_prompt and "exactly `search`" in specific_prompt,
+        "FL2 specific 模式含纯文本禁令反例语",
+    )
+    # FL3 auto / none 模式不受影响（不约束普通对话）
+    auto_prompt = build_tool_call_instructions(["get_weather"], tool_choice_policy={"mode": "auto", "tool_name": None})
+    none_prompt = build_tool_call_instructions(["get_weather"], tool_choice_policy={"mode": "none", "tool_name": None})
+    check(
+        "Do NOT write any plain-text reply" not in auto_prompt and "Do NOT write any plain-text reply" not in none_prompt,
+        "FL3 auto/none 模式不注入强制反例语",
+    )
+
+
+def check_p11(tmp: Path) -> None:
+    # GH1 .gitignore 覆盖抓包产物三类模式
+    gitignore = (RELAY_SRC.parent.parent / ".gitignore").read_text(encoding="utf-8")
+    for pattern in ("*.har", "*capture*.jsonl", "Default-*.json"):
+        check(pattern in gitignore, f"GH1 .gitignore 含 {pattern}")
+    # GH2 当前索引内没有命中这些模式的已跟踪文件
+    import subprocess
+
+    tracked = subprocess.run(
+        ["git", "ls-files"], capture_output=True, text=True, cwd=str(RELAY_SRC.parent.parent)
+    ).stdout.splitlines()
+    hits = [
+        f for f in tracked
+        if f.endswith(".har") or ("capture" in f and f.endswith(".jsonl")) or (f.startswith("Default-") and f.endswith(".json"))
+    ]
+    check(not hits, "GH2 已跟踪文件零抓包产物命中", ", ".join(hits[:5]))
+
+
 def main() -> int:
     os.environ.pop("GLM_TOKEN_FILE", None)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
@@ -1213,6 +1257,8 @@ def main() -> int:
         check_p07(tmp)
         check_p08(tmp)
         check_p09(tmp)
+        check_p10(tmp)
+        check_p11(tmp)
         check_runtime(tmp)
         check_p2(tmp)
         check_p6(tmp)

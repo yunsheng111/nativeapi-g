@@ -250,10 +250,13 @@ def build_tool_call_instructions(
             ]
         )
     elif mode == "required":
+        # P0-10 强制语对齐（对照 gptGrok A tool_prompt.py：反例语直击服从率瓶颈）
         lines.extend(
             [
                 "Tool choice policy: required.",
                 "You must call at least one tool before giving a final answer.",
+                "Do NOT write any plain-text reply under any circumstances. Do not explain, apologize, or narrate.",
+                "Your entire response must be the executable tool call block and nothing else.",
             ]
         )
     elif mode == "specific" and specific_name:
@@ -262,6 +265,7 @@ def build_tool_call_instructions(
                 "Tool choice policy: specific function.",
                 f"You must call exactly `{specific_name}` before giving a final answer.",
                 f"Do not call any tool other than `{specific_name}`.",
+                "Do NOT write any plain-text reply under any circumstances. Your entire response must be the executable tool call block.",
             ]
         )
     return "\n".join(lines)
