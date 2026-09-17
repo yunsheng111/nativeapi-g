@@ -15,11 +15,14 @@ import threading
 from http import HTTPStatus
 
 from glm2api.admin import (
+    ApiKeyStore,
     _api_err,
     _api_ok,
     _check_admin,
+    _persist_api_keys,
     _read_admin_body,
     _write_admin_json,
+    normalize_key_mode,
 )
 from glm2api.config import AppConfig
 from glm2api.services.glm_auth import GLMAccessTokenManager
@@ -29,6 +32,7 @@ from .accounts import LoginImportSession, TokenStore, import_from_text
 # 导入会话使用的调试端口。与用户日常浏览器的 9222 错开，避免互相抢占。
 LOGIN_DEBUG_PORT = 9333
 PREFIX = "/admin/api/accounts"
+TOOLS_PREFIX = "/admin/api/tools"
 
 
 def _runtime_account_stats() -> list[dict]:
@@ -88,6 +92,18 @@ class _SessionManager:
 
 def handle_admin_ext(handler, method: str, path: str, config: AppConfig) -> bool:
     """扩展管理端点分发。返回 True 表示请求已处理，调用方应直接 return。"""
+    # ── P5-b 工具策略：/admin/api/tools 前缀（鉴权与账号池同一道门）─────
+    if path.startswith(TOOLS_PREFIX):
+        if not _check_admin(handler):
+            _write_admin_json(handler, _api_err("Unauthorized"), HTTPStatus.UNAUTHORIZED)
+            return True
+        if method == "GET" and path == TOOLS_PREFIX:
+            _write_admin_json(handler, _api_ok(_tools_snapshot(handler, config)))
+            return True
+        if method == "POST" and path == f"{TOOLS_PREFIX}/key-mode":
+            return _handle_key_mode(handler)
+        return False  # 未匹配的 tools 子路径交还底座走 404
+
     if not path.startswith(PREFIX):
         return False
 
@@ -215,4 +231,128 @@ def handle_admin_ext(handler, method: str, path: str, config: AppConfig) -> bool
     return False
 
 
-__all__ = ["LOGIN_DEBUG_PORT", "PREFIX", "handle_admin_ext"]
+def _tools_snapshot(handler, config: AppConfig) -> dict:
+    """GET /admin/api/tools 的策略快照。
+
+    工厂表按物理隔离原则延迟 import（只在 GET 分支的调用路径上加载，不占
+    import 期）；MCP 只读运行态（绝不在这里 ensure_server 拉起子进程，快照
+    不应有副作用）；技能扫描直接复用 tools.skills 的发现函数，保证面板与
+    skills_list 工具看到的是同一份解析结果。
+    """
+    from .tools import mcp as _mcp
+    from .tools import skills as _skills
+    from .tools.browser import TOOL_FACTORIES as _BROWSER_FACTORIES
+    from .tools.fs import TOOL_FACTORIES as _FS_FACTORIES
+    from .tools.shell import TOOL_FACTORIES as _SHELL_FACTORIES
+    from .tools.skills import TOOL_FACTORIES as _SKILL_FACTORIES
+    from .tools.todo import TOOL_FACTORIES as _TODO_FACTORIES
+
+    # ── 内置工具：五个静态工厂表合并（MCP 动态工具单独走 mcp 节）──────
+    merged: dict = {}
+    for table in (_FS_FACTORIES, _SHELL_FACTORIES, _TODO_FACTORIES, _BROWSER_FACTORIES, _SKILL_FACTORIES):
+        merged.update(table)
+    enabled_names = {str(name).strip() for name in config.glm_builtin_tools if str(name).strip()}
+    builtin_tools = []
+    for name in sorted(merged):
+        # 工厂只构造 ToolSpec（handler 是未执行的闭包），无副作用
+        spec = merged[name](config)
+        builtin_tools.append({
+            "name": name,
+            "description": spec.description[:100],
+            "readonly": bool(spec.readonly),
+            "enabled": name in enabled_names,
+        })
+
+    # ── MCP：配置清单 + manager 运行态（_states 里已连接的才有存活信息）──
+    servers_cfg = [s for s in (config.glm_mcp_servers or []) if isinstance(s, dict)]
+    states: dict = {}
+    if servers_cfg:
+        states = getattr(_mcp.get_mcp_manager(), "_states", None) or {}
+    mcp_servers = []
+    for entry in servers_cfg:
+        sname = str(entry.get("name") or "").strip()
+        command_line = " ".join(
+            [str(entry.get("command") or "")] + [str(a) for a in (entry.get("args") or [])]
+        ).strip()
+        state = states.get(sname)
+        alive = None
+        tool_count = 0
+        if state is not None:
+            alive = not (bool(state.dead) or state.proc.poll() is not None)
+            tool_count = len(state.tools or [])
+        mcp_servers.append({"name": sname, "command": command_line[:80], "alive": alive, "tool_count": tool_count})
+
+    # 已注册的 mcp 工具名：按 build_mcp_factories 的同一套命名/glob/去重规则
+    # 从已连接服务器的 tools/list 缓存推导，避免第二份注册逻辑
+    registered_tools: list = []
+    if servers_cfg and states:
+        patterns = _mcp._parse_patterns(getattr(config, "glm_mcp_tools", None))
+        used: set = set()
+        for entry in servers_cfg:
+            sname = str(entry.get("name") or "").strip()
+            state = states.get(sname)
+            for tool in (state.tools if state is not None else None) or []:
+                if not isinstance(tool, dict):
+                    continue
+                tname = str(tool.get("name") or "").strip()
+                if not tname:
+                    continue
+                base = _mcp._registered_name(sname, tname)
+                if not _mcp._match_any(base, patterns):
+                    continue
+                final = _mcp._dedupe_name(base, used)
+                used.add(final)
+                registered_tools.append(final)
+        registered_tools.sort()
+
+    # ── 技能：复用工具模块的扫描（候选目录含固定目录，先到先得语义一致）──
+    skill_entries, skill_dirs = _skills._discover_skills(config)
+    skills_payload = {
+        "dirs": [str(d) for d in skill_dirs],
+        "found": [
+            {"name": e.name, "description": (e.description or "")[:80]}
+            for e in skill_entries
+        ],
+    }
+
+    settings = {
+        "builtin_max_rounds": config.glm_builtin_max_rounds,
+        "shell_timeout_seconds": config.glm_shell_timeout_seconds,
+        "tool_fs_root": config.glm_tool_fs_root,
+        "mcp_tools_glob": config.glm_mcp_tools,
+        "skills_dirs": list(config.glm_skills_dirs),
+        "browser_headless": bool(config.glm_tool_browser_headless),
+        "browser_allow_private": bool(config.glm_tool_browser_allow_private),
+    }
+
+    return {
+        "global_mode": config.glm_tool_mode,
+        "builtin_tools": builtin_tools,
+        "settings": settings,
+        "mcp": {"configured": bool(servers_cfg), "servers": mcp_servers, "tools": registered_tools},
+        "skills": skills_payload,
+        "api_keys": handler._admin_api_key_store.list_all(),
+    }
+
+
+def _handle_key_mode(handler) -> bool:
+    """POST /admin/api/tools/key-mode：改单个 API Key 的工具模式绑定。"""
+    body = _read_admin_body(handler)
+    name = str(body.get("name") or "").strip()
+    if not name:
+        _write_admin_json(handler, _api_err("缺少 name"), HTTPStatus.BAD_REQUEST)
+        return True
+    store: ApiKeyStore = handler._admin_api_key_store
+    if store.get(name) is None:
+        _write_admin_json(handler, _api_err(f"API Key '{name}' 不存在"), HTTPStatus.NOT_FOUND)
+        return True
+    # 非法值由 normalize_key_mode 回落「跟随全局」，与 P5-a 的宽容语义一致
+    tool_mode = normalize_key_mode(body.get("tool_mode"))
+    store.update(name, tool_mode=tool_mode)
+    _persist_api_keys(handler)
+    updated = store.get(name)
+    _write_admin_json(handler, _api_ok(updated.to_dict(mask=True) if updated else {}, "已更新"))
+    return True
+
+
+__all__ = ["LOGIN_DEBUG_PORT", "PREFIX", "TOOLS_PREFIX", "handle_admin_ext"]

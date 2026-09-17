@@ -386,6 +386,119 @@
           </div>
         </n-card>
       </template>
+
+      <!-- ── 工具策略 (P5-b) ───────────────────────────────── -->
+      <template v-if="activeNav==='tools'">
+        <h2 class="section-title">工具策略</h2>
+
+        <div class="card-grid">
+          <div class="stat-card">
+            <div class="label">全局工具模式</div>
+            <div class="value" style="margin-top:10px">
+              <span class="badge" :class="toolsSnap && toolsSnap.global_mode==='builtin' ? 'badge-ok' : 'badge-info'">
+                {{ toolsSnap ? (toolsSnap.global_mode==='builtin' ? 'builtin 内置闭环' : 'passthrough 透传') : '--' }}
+              </span>
+            </div>
+          </div>
+          <div class="stat-card"><div class="label">内置工具启用</div><div class="value">{{ toolEnabledCount }} / {{ toolTotalCount }}</div></div>
+          <div class="stat-card"><div class="label">MCP 服务器在线</div><div class="value">{{ mcpAliveCount }} / {{ mcpTotalCount }}</div></div>
+          <div class="stat-card"><div class="label">技能数</div><div class="value">{{ skillCount }}</div></div>
+        </div>
+
+        <div style="margin-bottom:14px;display:flex;gap:10px;align-items:center">
+          <n-button size="small" @click="fetchTools" :loading="toolsLoading">刷新</n-button>
+          <n-text depth="3" style="font-size:12px">
+            builtin 模式下中转端闭环执行启用的内置工具；名单外的工具对模型物理不可见
+          </n-text>
+        </div>
+
+        <h3 style="font-size:15px;font-weight:700;margin:10px 0 8px">内置工具（GLM_BUILTIN_TOOLS 名单）</h3>
+        <table class="data-table" v-if="toolsSnap && toolsSnap.builtin_tools.length">
+          <thead><tr><th>工具</th><th>描述</th><th>只读</th><th>启用状态</th></tr></thead>
+          <tbody>
+            <tr v-for="t in toolsSnap.builtin_tools" :key="t.name">
+              <td class="mono">{{ t.name }}</td>
+              <td style="max-width:420px;color:var(--muted)">{{ t.description }}</td>
+              <td><span class="badge" :class="t.readonly?'badge-info':'badge-warn'">{{ t.readonly ? '只读' : '可写' }}</span></td>
+              <td><span class="badge" :class="t.enabled?'badge-ok':'badge-err'">{{ t.enabled ? '已启用' : '未启用' }}</span></td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="empty-state" v-else-if="toolsLoading">加载中...</div>
+        <div class="empty-state" v-else>暂无内置工具定义</div>
+
+        <h3 style="font-size:15px;font-weight:700;margin:26px 0 8px">MCP 服务器（GLM_MCP_SERVERS）</h3>
+        <div class="card-grid" style="grid-template-columns:repeat(auto-fill,minmax(280px,1fr))" v-if="toolsSnap && toolsSnap.mcp.servers.length">
+          <div class="stat-card" v-for="s in toolsSnap.mcp.servers" :key="s.name">
+            <div class="label">{{ s.name }} · {{ s.tool_count }} 个工具</div>
+            <div class="value" style="font-size:16px;margin-top:10px">
+              <span class="badge" :class="s.alive===true?'badge-ok':(s.alive===false?'badge-err':'badge-warn')">
+                {{ s.alive===true ? '在线' : (s.alive===false ? '已退出' : '未启动') }}
+              </span>
+            </div>
+            <div class="mono" style="margin-top:8px;font-size:11px;color:var(--muted);word-break:break-all">{{ s.command }}</div>
+          </div>
+        </div>
+        <div class="empty-state" v-else-if="toolsSnap">
+          未配置 MCP 服务器。在 .env 里设置 GLM_MCP_SERVERS（JSON 数组，如
+          <span class="mono">[{"name":"fs","command":"npx","args":["-y","@modelcontextprotocol/server-filesystem","/tmp"]}]</span>）
+          即启用对应 <span class="mono">mcp__&lt;server&gt;__&lt;tool&gt;</span> 工具，配置即生效。
+        </div>
+        <div v-if="toolsSnap && toolsSnap.mcp.tools.length" style="margin-top:10px">
+          <div class="hint-text" style="margin-bottom:6px">已注册的 MCP 工具（GLM_MCP_TOOLS={{ toolsSnap.settings.mcp_tools_glob }}）：</div>
+          <div class="tag-list">
+            <span class="tag" v-for="t in toolsSnap.mcp.tools" :key="t">{{ t }}</span>
+          </div>
+        </div>
+
+        <h3 style="font-size:15px;font-weight:700;margin:26px 0 8px">技能包（GLM_SKILLS_DIRS）</h3>
+        <table class="data-table" v-if="toolsSnap && toolsSnap.skills.found.length">
+          <thead><tr><th>技能</th><th>描述</th></tr></thead>
+          <tbody>
+            <tr v-for="sk in toolsSnap.skills.found" :key="sk.name">
+              <td class="mono">{{ sk.name }}</td>
+              <td style="max-width:420px;color:var(--muted)">{{ sk.description || '—' }}</td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="empty-state" v-else-if="toolsSnap">
+          未找到任何技能。在以下目录放置 <span class="mono">&lt;技能名&gt;/SKILL.md</span> 即可：
+          <div class="mono" style="margin-top:6px;font-size:11px;word-break:break-all">{{ toolsSnap.skills.dirs.join('  ·  ') }}</div>
+        </div>
+
+        <h3 style="font-size:15px;font-weight:700;margin:26px 0 8px">API Key 工具模式绑定</h3>
+        <div class="hint-text" style="margin-bottom:8px">
+          每个 Key 可单独绑定工具模式（优先级：请求头 &gt; 模型 @builtin 后缀 &gt; Key 绑定 &gt; 全局）；「跟随全局」表示不做 Key 级覆盖。
+        </div>
+        <table class="data-table" v-if="toolsSnap && toolsSnap.api_keys.length">
+          <thead><tr><th>名称</th><th>密钥</th><th>工具模式</th><th style="width:110px">操作</th></tr></thead>
+          <tbody>
+            <tr v-for="k in toolsSnap.api_keys" :key="k.name">
+              <td class="mono">{{ k.name }}</td>
+              <td class="mono" style="color:var(--muted)">{{ k.key }}</td>
+              <td>
+                <n-select v-model:value="keyModeDrafts[k.name]" :options="keyModeOpts" size="small" style="width:230px"></n-select>
+              </td>
+              <td>
+                <n-button size="tiny" type="primary" :loading="keyModeSaving===k.name" @click="saveKeyMode(k.name)">保存</n-button>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="empty-state" v-else-if="toolsSnap">
+          暂无 API Key。先在「API Key」页创建，再回到这里绑定工具模式。
+        </div>
+
+        <h3 style="font-size:15px;font-weight:700;margin:26px 0 8px">运行参数</h3>
+        <div class="stat-card" v-if="toolsSnap">
+          <div class="kv-row"><span class="kv-key">builtin 最大轮数</span><span class="kv-val">{{ toolsSnap.settings.builtin_max_rounds }}</span></div>
+          <div class="kv-row"><span class="kv-key">shell 超时（秒）</span><span class="kv-val">{{ toolsSnap.settings.shell_timeout_seconds }}</span></div>
+          <div class="kv-row"><span class="kv-key">文件沙箱根</span><span class="kv-val">{{ toolsSnap.settings.tool_fs_root }}</span></div>
+          <div class="kv-row"><span class="kv-key">MCP 工具 glob</span><span class="kv-val">{{ toolsSnap.settings.mcp_tools_glob }}</span></div>
+          <div class="kv-row"><span class="kv-key">浏览器无头</span><span class="kv-val">{{ toolsSnap.settings.browser_headless ? '是' : '否' }}</span></div>
+          <div class="kv-row"><span class="kv-key">浏览器允许私网</span><span class="kv-val">{{ toolsSnap.settings.browser_allow_private ? '是' : '否' }}</span></div>
+        </div>
+      </template>
     </main>
   </div>
 </div>
@@ -393,6 +506,8 @@
 <script>
 const { createApp, ref, computed, onMounted, onUnmounted, watch } = Vue;
 const naive = window.naive;
+// 工具策略页保存成功/失败提示用（discrete API 不依赖模板里挂 Provider，其他页不受影响）
+const toolsMessage = naive.createDiscreteApi(['message']).message;
 
 const naiveComponents = ['NButton','NInput','NSelect','NSpace','NH3','NText','NCard','NSwitch','NModal','NTag','NH2','NH1'];
 const app = createApp({
@@ -409,6 +524,7 @@ const app = createApp({
       { id: 'config', label: '配置', icon: '⚙' },
       { id: 'tokens', label: 'Token', icon: '🔑' },
       { id: 'api-keys', label: 'API Key', icon: '🔐' },
+      { id: 'tools', label: '工具策略', icon: '🧰' },
       { id: 'logs', label: '日志', icon: '📋' },
       { id: 'requests', label: '请求记录', icon: '📊' },
       { id: 'chat', label: '对话测试', icon: '💬' },
@@ -783,6 +899,52 @@ const app = createApp({
       await fetchApiKeys(); await fetchConfig();
     }
 
+    // ── 工具策略（P5-b）──────────────────────────────────────
+    const toolsSnap = ref(null);
+    const toolsLoading = ref(false);
+    const keyModeDrafts = ref({});
+    const keyModeSaving = ref('');
+    const keyModeOpts = [
+      { label: '跟随全局', value: '' },
+      { label: 'passthrough（客户端执行）', value: 'passthrough' },
+      { label: 'builtin（中转端闭环）', value: 'builtin' },
+    ];
+    const toolEnabledCount = computed(() => toolsSnap.value ? toolsSnap.value.builtin_tools.filter(t => t.enabled).length : 0);
+    const toolTotalCount = computed(() => toolsSnap.value ? toolsSnap.value.builtin_tools.length : 0);
+    const mcpAliveCount = computed(() => toolsSnap.value ? toolsSnap.value.mcp.servers.filter(s => s.alive === true).length : 0);
+    const mcpTotalCount = computed(() => toolsSnap.value ? toolsSnap.value.mcp.servers.length : 0);
+    const skillCount = computed(() => toolsSnap.value && toolsSnap.value.skills ? toolsSnap.value.skills.found.length : 0);
+
+    async function fetchTools() {
+      toolsLoading.value = true;
+      try {
+        const d = await api('/admin/api/tools');
+        if (d) {
+          toolsSnap.value = d;
+          // 下拉草稿以服务端当前值为准；保存失败时重新拉取也会还原
+          const drafts = {};
+          (d.api_keys || []).forEach(k => { drafts[k.name] = k.tool_mode || ''; });
+          keyModeDrafts.value = drafts;
+        }
+      } catch (e) {}
+      finally { toolsLoading.value = false; }
+    }
+
+    async function saveKeyMode(name) {
+      keyModeSaving.value = name;
+      try {
+        await api('/admin/api/tools/key-mode', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name, tool_mode: keyModeDrafts.value[name] || '' }),
+        });
+        toolsMessage.success('已保存 "' + name + '" 的工具模式');
+        await fetchTools();
+      } catch (e) {
+        toolsMessage.error('保存失败：' + e.message);
+      }
+      finally { keyModeSaving.value = ''; }
+    }
+
     function loadAll() { fetchOverview(); fetchConfig(); fetchLogs(); fetchRequests(); fetchApiKeys(); loadModels(); }
 
     watch(activeNav, (v) => {
@@ -794,6 +956,7 @@ const app = createApp({
       if (v === 'accounts') { fetchAccounts().then(() => { if (importRunning.value) startImportTimer(); }); }
       if (v === 'config' || v === 'tokens') fetchConfig();
       if (v === 'api-keys') { fetchConfig(); fetchApiKeys(); }
+      if (v === 'tools') fetchTools();
       if (v === 'chat') { loadModels(); }
       tokenPage.value = 1;
     });
@@ -818,6 +981,8 @@ const app = createApp({
       pasteText, pasteBusy, pasteResult, fetchAccounts, startImport, stopImport,
       deleteAccount, pasteImport, sourceLabel,
       runtimeStats, probeBusy, probeAccounts, runtimeAt, runtimeLabel, runtimeBadgeClass, runtimeSuccessRate,
+      toolsSnap, toolsLoading, fetchTools, keyModeDrafts, keyModeSaving, keyModeOpts, saveKeyMode,
+      toolEnabledCount, toolTotalCount, mcpAliveCount, mcpTotalCount, skillCount,
     };
   }
 });
