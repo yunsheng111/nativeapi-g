@@ -11,6 +11,7 @@
     P2.6/P0-1 状态码分类 + 401 权威标记       （断言 K1-K8，S6 的 401 用例随语义收紧）
     P2.6/I1  身份字段单一数据源 + 矛盾自检     （断言 I1-a..I1-g，F4 观测性回归）
     B2  token 别名表 + CAS 替换               （断言 A1-a~f：轮换后真实 deid 不断链）
+    P3  模式 B 内置工具运行时                 （断言 T1-T5：fs/shell/todo + registry 物理隔离与执行契约）
 
 用法：
     python tools/check_riskctrl.py
@@ -1498,6 +1499,338 @@ def check_statspersist(tmp: Path, tok1: str) -> None:
     )
 
 
+def check_p3agent(tmp: Path) -> None:
+    """P3：模式 B agent loop 离线闭环（mock 上游，不依赖真网）。"""
+    import json as _json
+    from glmrelay.agent.loop import (
+        aggregate_builtin_response,
+        handle_builtin_request,
+        run_builtin_agent,
+    )
+    from glmrelay.bridge.mode import resolve_tool_mode, strip_builtin_suffix
+    from glm2api.config import load_config  # 本函数自身构造 config（main 的局部导入不进这里）
+
+    # AG-a 模式判定三层覆盖 + 非法值回落 + 后缀剥离
+    check(resolve_tool_mode({"X-GLM2API-Tool-Mode": "builtin"}, "glm-4", "passthrough") == "builtin",
+          "AG-a-1 请求头覆盖最高")
+    check(resolve_tool_mode(None, "glm-4@builtin", "passthrough") == "builtin",
+          "AG-a-2 模型 @builtin 后缀次之")
+    check(resolve_tool_mode(None, "glm-4", "builtin") == "builtin",
+          "AG-a-3 全局默认兜底")
+    check(resolve_tool_mode({"x-glm2api-tool-mode": "bogus"}, "glm-4", "passthrough") == "passthrough",
+          "AG-a-4 非法头值回落 passthrough")
+    check(strip_builtin_suffix("glm-4-flash@builtin") == "glm-4-flash"
+          and strip_builtin_suffix("glm-4-flash") == "glm-4-flash",
+          "AG-a-5 @builtin 后缀剥离")
+
+    class FakeClient:
+        """mock 上游：按脚本顺序返回响应。"""
+
+        def __init__(self, script):
+            self.script = list(script)
+            self.calls: list[dict] = []
+
+        def chat_completion(self, payload):
+            self.calls.append(payload)
+            return self.script.pop(0), "conv-1"
+
+    def response(message: dict) -> dict:
+        return {"choices": [{"index": 0, "message": message, "finish_reason": None}]}
+
+    from glmrelay.tools import registry as registry_mod
+    from glmrelay.tools.registry import ToolSpec
+
+    def fake_tool(name: str, output: str) -> ToolSpec:
+        return ToolSpec(
+            name=name, description="fake", parameters={"type": "object", "properties": {}},
+            handler=lambda args, session: output, readonly=True,
+        )
+
+    registry_mod.build_registry  # 引用完整性
+    config = load_config(str(tmp / ".env"))
+    config.glm_builtin_tools = ["echo_tool"]
+    config.glm_tool_mode = "passthrough"
+    config.glm_builtin_max_rounds = 3
+
+    # 注册一个 fake 工具：monkeypatch build_builtin_registry 的工厂来源
+    import glmrelay.agent.loop as loop_mod
+
+    def make_registry(config_arg):
+        # run_builtin_agent 调用形态是 build_builtin_registry(config)：
+        # mock 从 config.glm_builtin_tools 取启用名单，注册同名 fake 工具
+        reg = registry_mod.ToolRegistry()
+        for n in list(config_arg.glm_builtin_tools):
+            reg.register(fake_tool(n, "echo: " + n))
+        return reg
+
+    orig_build = loop_mod.build_builtin_registry
+    loop_mod.build_builtin_registry = make_registry
+    try:
+        # AG-b 非 builtin 模式不接管（透传）
+        handled = handle_builtin_request({"model": "glm-4", "messages": []}, {}, FakeClient([]), config)
+        check(handled is None, "AG-b 非 builtin 模式返回 None（透传不接管）")
+
+        # AG-c 闭环：第一轮 tool_calls → 执行 → 回灌；第二轮纯文本收尾
+        client = FakeClient([
+            response({"role": "assistant", "content": None, "tool_calls": [
+                {"id": "call_1", "type": "function",
+                 "function": {"name": "echo_tool", "arguments": "{\"value\": 1}"}}
+            ]}),
+            response({"role": "assistant", "content": "工具结果总结"}),
+        ])
+        payload = {"model": "glm-4@builtin", "messages": [{"role": "user", "content": "hi"}], "tools": [{"fake": True}]}
+        stream = b"".join(run_builtin_agent(dict(payload, **{"stream": True}), client, config, logging.getLogger("ag")))
+        text = stream.decode("utf-8")
+        check('"content": "echo_tool' in text or "echo_tool 成功" in text, "AG-c-a 进度 delta 含工具执行摘要", text[-400:])
+        check("工具结果总结" in text, "AG-c-b 最终答复下发")
+        check("data: [DONE]" in text, "AG-c-c [DONE] 收尾")
+        check(client.calls[0].get("tools") and client.calls[0]["tools"][0]["function"]["name"] == "echo_tool",
+              "AG-c-d 内置工具 schema 注入 payload.tools")
+        second_round_messages = client.calls[1]["messages"]
+        check(
+            any(m.get("role") == "assistant" and m.get("tool_calls") for m in second_round_messages)
+            and any(m.get("role") == "tool" and m.get("tool_call_id") == "call_1" for m in second_round_messages),
+            "AG-c-e assistant tool_calls 与 role:tool 成对回灌（id 对齐前提）",
+        )
+        check(client.calls[1]["messages"][-1]["content"].startswith("echo: "), "AG-c-f 工具输出全文回灌给模型")
+        # 客户端声明的 tools 被忽略；非流式聚合为完整 response
+        client_stream_false = FakeClient([response({"role": "assistant", "content": "工具结果总结"})])
+        handled2 = handle_builtin_request(
+            {"model": "glm-4@builtin", "messages": [], "stream": False, "tools": [{"fake": True}]},
+            {}, client_stream_false, config,
+        )
+        check(isinstance(handled2, dict) and "工具结果总结" in handled2["choices"][0]["message"]["content"],
+              "AG-c-g 非流式聚合为完整 response")
+
+        # AG-d 工具参数坏 JSON → error 回灌且循环继续
+        client_bad = FakeClient([
+            response({"role": "assistant", "content": None, "tool_calls": [
+                {"id": "call_bad", "type": "function",
+                 "function": {"name": "echo_tool", "arguments": "{broken"}}
+            ]}),
+            response({"role": "assistant", "content": "done"}),
+        ])
+        stream_bad = b"".join(run_builtin_agent(
+            {"model": "glm-4", "messages": [{"role": "user", "content": "hi"}]}, client_bad, config,
+            logging.getLogger("ag"),
+        )).decode("utf-8")
+        check("工具参数解析失败" in stream_bad and "done" in stream_bad,
+              "AG-d 坏参数 error 回灌且循环继续")
+
+        # AG-e 轮数上限：恒返回 tool_calls → max_rounds 后终止并说明
+        endless = response({"role": "assistant", "content": None, "tool_calls": [
+            {"id": "call_x", "type": "function", "function": {"name": "echo_tool", "arguments": "{}"}}
+        ]})
+        client_loop = FakeClient([endless] * 10)
+        stream_loop = b"".join(run_builtin_agent(
+            {"model": "glm-4", "messages": [{"role": "user", "content": "hi"}]}, client_loop, config,
+            logging.getLogger("ag"),
+        )).decode("utf-8")
+        check("已达最大工具轮数" in stream_loop and len(client_loop.script) == 7,
+              "AG-e 轮数上限终止（3 轮后不再调上游）")
+    finally:
+        loop_mod.build_builtin_registry = orig_build
+
+    # AG-f 空注册表显式失败
+    empty_config = load_config(str(tmp / ".env"))
+    empty_config.glm_builtin_tools = []
+    stream_empty = b"".join(run_builtin_agent(
+        {"model": "glm-4", "messages": [{"role": "user", "content": "hi"}]}, FakeClient([]), empty_config,
+        logging.getLogger("ag"),
+    )).decode("utf-8")
+    check("未启用任何内置工具" in stream_empty, "AG-f 空注册表显式失败不静默透传")
+
+    # AG-g aggregate 纯聚合
+    def tiny_stream():
+        yield _fake_chunk_bytes("你好")
+        yield _fake_chunk_bytes("世界")
+
+    def _fake_chunk_bytes(content: str) -> bytes:
+        event = {"choices": [{"index": 0, "delta": {"content": content}, "finish_reason": None}]}
+        # 对齐 loop._chunk 的真实 SSE 帧格式（data: 前缀），aggregate 按该格式解析
+        return ("data: " + _json.dumps(event, ensure_ascii=False) + "\n\n").encode("utf-8")
+
+    aggregated = aggregate_builtin_response(tiny_stream())
+    check(aggregated["choices"][0]["message"]["content"] == "你好世界", "AG-g 非流式聚合拼接 content")
+
+
+# --------------------------------------------------------------- P3 内置工具运行时（fs/shell/todo）
+
+def check_p3tools() -> None:
+    """P3 模式 B：内置工具三模块 + registry 物理隔离 + 统一执行契约。
+
+    不往共享 tmp 写垃圾：自建 mkdtemp 沙箱目录，finally 清理。
+    覆盖：T1 文件工具（沙箱/行号/唯一替换/glob/二进制跳过/只删文件）、
+    T2 shell（危险命令正则 + 真实执行 + 超时）、T3 todo（状态渲染 + 非法值）、
+    T4 物理隔离（名单外不注册 + 未注册调用报错）、T5 异常转 error 结果。
+    """
+    from glm2api.config import load_config
+    from glmrelay.tools import fs as fs_tools
+    from glmrelay.tools import shell as shell_tools
+    from glmrelay.tools import todo as todo_tools
+    from glmrelay.tools.registry import ToolRegistry, ToolSpec, build_registry
+    from glmrelay.tools.safety import check_shell_command
+
+    root = Path(tempfile.mkdtemp(prefix="p3tools_"))
+    sandbox = root / "sandbox"
+    sandbox.mkdir()
+    try:
+        env_path = root / ".env"
+        env_path.write_text("GLM_TOOL_FS_ROOT=" + str(sandbox) + "\n", encoding="utf-8")
+        cfg = load_config(str(env_path))
+        check(Path(cfg.glm_tool_fs_root).resolve() == sandbox.resolve(),
+              "T0 GLM_TOOL_FS_ROOT 接线到 config.glm_tool_fs_root")
+
+        def tool_handler(module, name: str):
+            return module.TOOL_FACTORIES[name](cfg).handler
+
+        read_file = tool_handler(fs_tools, "read_file")
+        write_file = tool_handler(fs_tools, "write_file")
+        edit_file = tool_handler(fs_tools, "edit_file")
+        list_dir = tool_handler(fs_tools, "list_dir")
+        grep_files = tool_handler(fs_tools, "grep_files")
+        delete_file = tool_handler(fs_tools, "delete_file")
+        run_command = tool_handler(shell_tools, "run_command")
+        todo_write = tool_handler(todo_tools, "todo_write")
+
+        def raises_value_error(fn, *fn_args, **fn_kwargs) -> tuple[bool, str]:
+            try:
+                fn(*fn_args, **fn_kwargs)
+            except ValueError as exc:
+                return True, str(exc)
+            return False, ""
+
+        # ---- T1 文件工具（全部路径收敛在沙箱内）
+        # T1-a read_file 正常读取 + offset/limit 行号（0 起）
+        msg = write_file({"path": "notes/a.txt", "content": "第一行\n第二行\n第三行"}, None)
+        check("已写入" in msg, "T1-a-1 write_file 覆盖写并自动建父目录", msg)
+        full = read_file({"path": "notes/a.txt"}, None)
+        check(full.splitlines() == ["第一行", "第二行", "第三行"], "T1-a-2 read_file 全文按行返回", full)
+        window = read_file({"path": "notes/a.txt", "offset": 1, "limit": 1}, None)
+        check(window.splitlines() == ["第二行"], "T1-a-3 read_file offset/limit 行号正确（0 起）", window)
+
+        # T1-b 越界路径拒绝（.. 逃逸 + 沙箱外绝对路径）
+        (root / "outside.txt").write_text("secret", encoding="utf-8")
+        hit, detail = raises_value_error(read_file, {"path": "../outside.txt"}, None)
+        check(hit, "T1-b-1 read_file 拒绝 .. 逃逸路径", detail)
+        hit, detail = raises_value_error(read_file, {"path": str(root / "outside.txt")}, None)
+        check(hit, "T1-b-2 read_file 拒绝沙箱外绝对路径", detail)
+        hit, detail = raises_value_error(read_file, {"path": "missing.txt"}, None)
+        check(hit, "T1-b-3 read_file 文件不存在报 ValueError", detail)
+
+        # T1-c write_file 写入 + list_dir 可见
+        write_file({"path": "notes/b.log", "content": "log-line"}, None)
+        listing = list_dir({"path": "notes"}, None)
+        check("a.txt" in listing and "b.log" in listing and "[file]" in listing and "字节" in listing,
+              "T1-c-1 list_dir 列出名字/类型/大小", listing)
+        filtered = list_dir({"path": "notes", "pattern": "*.txt"}, None)
+        check("a.txt" in filtered and "b.log" not in filtered, "T1-c-2 list_dir pattern 通配过滤", filtered)
+
+        # T1-d edit_file 唯一匹配替换；多次出现拒绝
+        write_file({"path": "edit.txt", "content": "hello world\nhello again"}, None)
+        edit_msg = edit_file({"path": "edit.txt", "old_string": "world", "new_string": "GLM"}, None)
+        check("替换" in edit_msg and "hello GLM" in read_file({"path": "edit.txt"}, None),
+              "T1-d-1 edit_file 唯一匹配替换成功", edit_msg)
+        hit, detail = raises_value_error(edit_file, {"path": "edit.txt", "old_string": "hello", "new_string": "X"}, None)
+        check(hit and "2" in detail, "T1-d-2 多次出现拒绝并说明出现次数", detail)
+        hit, detail = raises_value_error(edit_file, {"path": "edit.txt", "old_string": "absent", "new_string": "X"}, None)
+        check(hit, "T1-d-3 出现 0 次拒绝替换", detail)
+
+        # T1-e grep_files：命中形态 / glob 过滤 / 二进制跳过 / 大小写 / max_results
+        write_file({"path": "src/main.py", "content": "import os\nTOKEN = 'abc'\n"}, None)
+        write_file({"path": "src/skip.log", "content": "TOKEN = 'abc'\n"}, None)
+        (sandbox / "src" / "bin.dat").write_bytes(b"TOKEN = 'abc'\x00binary")
+        grep_all = grep_files({"pattern": "TOKEN"}, None)
+        check("src/main.py:2: TOKEN = 'abc'" in grep_all, "T1-e-1 命中行输出形态 相对路径:行号: 内容", grep_all)
+        grep_py = grep_files({"pattern": "TOKEN", "path": "src", "glob": "*.py"}, None)
+        check("main.py" in grep_py and "skip.log" not in grep_py, "T1-e-2 glob 过滤生效", grep_py)
+        grep_bin = grep_files({"pattern": "TOKEN", "path": "src", "glob": "*.dat"}, None)
+        check("bin.dat" not in grep_bin and "无匹配" in grep_bin, "T1-e-3 二进制文件（前 1KB 含 NUL）跳过", grep_bin)
+        grep_ci = grep_files({"pattern": "token", "path": "src", "glob": "*.py"}, None)
+        check("main.py" in grep_ci, "T1-e-4 re.IGNORECASE 大小写不敏感", grep_ci)
+        write_file({"path": "many.txt", "content": "\n".join("hit" + str(i) for i in range(10))}, None)
+        grep_cap = grep_files({"pattern": "hit", "path": "many.txt", "max_results": 3}, None)
+        check(grep_cap.count("many.txt:") == 3 and "截断" in grep_cap, "T1-e-5 max_results 截断并注明", grep_cap)
+
+        # T1-f delete_file 只删文件不删目录
+        write_file({"path": "doomed.txt", "content": "bye"}, None)
+        del_msg = delete_file({"path": "doomed.txt"}, None)
+        check("已删除" in del_msg and not (sandbox / "doomed.txt").exists(), "T1-f-1 delete_file 删文件成功", del_msg)
+        hit, detail = raises_value_error(delete_file, {"path": "notes"}, None)
+        check(hit, "T1-f-2 delete_file 拒绝删除目录", detail)
+
+        # ---- T2 shell 工具
+        check(check_shell_command("rm -rf /") is not None, "T2-a-1 拒绝 rm -rf /")
+        check(check_shell_command("del /s /q") is not None, "T2-a-2 拒绝 del /s /q")
+        check(check_shell_command("shutdown /s") is not None, "T2-a-3 拒绝 shutdown /s")
+        check(check_shell_command("python --version") is None, "T2-a-4 放行 python --version")
+
+        out = run_command({"command": "python --version"}, None)
+        check("Python" in out and "退出码: 0" in out, "T2-b-1 run_command 真实执行 python --version", out)
+        # 超时路径：monkeypatch 超时阈值为 0.1s，命令用平台 sleep 形态拖过阈值
+        prev_timeout = cfg.glm_shell_timeout_seconds
+        try:
+            cfg.glm_shell_timeout_seconds = 0.1
+            slow = "ping -n 3 127.0.0.1 > nul" if sys.platform == "win32" else "sleep 2"
+            hit, detail = raises_value_error(run_command, {"command": slow}, None)
+        finally:
+            cfg.glm_shell_timeout_seconds = prev_timeout
+        check(hit and "超时" in detail, "T2-b-2 超时命令被终止并报 ValueError", detail)
+
+        # ---- T3 todo 工具
+        class FakeSession:
+            def __init__(self) -> None:
+                self.todo_list = None
+
+        sess = FakeSession()
+        todo_out = todo_write({"todos": [
+            {"content": "任务甲", "status": "pending"},
+            {"content": "任务乙", "status": "in_progress"},
+            {"content": "任务丙", "status": "completed"},
+        ]}, sess)
+        check("[ ] 任务甲" in todo_out and "[~] 任务乙" in todo_out and "[x] 任务丙" in todo_out,
+              "T3-a-1 三种状态前缀渲染 [ ]/[~]/[x]", todo_out)
+        check(isinstance(sess.todo_list, list) and len(sess.todo_list) == 3, "T3-a-2 状态写入 session.todo_list")
+        check("共 3 项" in todo_out, "T3-a-3 计数摘要", todo_out.splitlines()[-1])
+        hit, detail = raises_value_error(todo_write, {"todos": [{"content": "x", "status": "done"}]}, sess)
+        check(hit, "T3-a-4 非法 status 报 ValueError", detail)
+
+        # ---- T4 registry 物理隔离
+        builders = {}
+        for module in (fs_tools, shell_tools, todo_tools):
+            for name, factory in module.TOOL_FACTORIES.items():
+                builders[name] = (lambda f=factory, c=cfg: f(c))
+        reg = build_registry(["read_file", "list_dir", "grep_files", "todo_write"], builders)
+        names = reg.names()
+        check(names == ["grep_files", "list_dir", "read_file", "todo_write"],
+              "T4-a 只注册名单内工具（物理隔离）", str(names))
+        check(not set(names) & {"write_file", "edit_file", "run_command", "delete_file"},
+              "T4-b 写档/执行/删除工具默认不注册", str(names))
+        miss = reg.run_tool("write_file", {}, None)
+        check(not miss.ok and "工具不存在" in miss.output, "T4-c 未注册工具调用返回 error 结果", miss.output)
+
+        # ---- T5 run_tool 执行契约：异常转 error 结果，成功原文回灌
+        reg2 = ToolRegistry()
+
+        def boom(args, session):
+            raise RuntimeError("boom 内部爆炸")
+
+        reg2.register(ToolSpec(name="boom_tool", description="t",
+                               parameters={"type": "object", "properties": {}}, handler=boom))
+        bad = reg2.run_tool("boom_tool", {}, None)
+        check(not bad.ok and "RuntimeError" in bad.output and "boom" in bad.output,
+              "T5-a handler 异常转 error 结果（含异常信息）", bad.output)
+        reg2.register(ToolSpec(name="ok_tool", description="t",
+                               parameters={"type": "object", "properties": {}},
+                               handler=lambda args, session: "一切正常"))
+        good = reg2.run_tool("ok_tool", {}, None)
+        check(good.ok and good.output == "一切正常", "T5-b 成功路径 ok=True 原文回灌", good.output)
+        noargs = reg2.run_tool("ok_tool", None, None)
+        check(noargs.ok, "T5-c arguments=None 容错为空参数")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 # --------------------------------------------------------------- P2.5-2 I1 身份字段单一数据源 + 矛盾自检
 
 def check_identity(tmp: Path) -> None:
@@ -1664,6 +1997,8 @@ def main() -> int:
         check_streamguard()
         check_identity(tmp)
         check_statspersist(tmp, _tok1)
+        check_p3agent(tmp)
+        check_p3tools()
     finally:
         os.chdir(prev_cwd)
         shutil.rmtree(tmp, ignore_errors=True)

@@ -56,6 +56,15 @@ except ImportError:  # glmrelay 未安装时底座仍可独立运行
     def _handle_admin_ext(handler, method: str, path: str, config) -> bool:
         return False
 
+# P3 模式 B：builtin 工具循环处理器（glmrelay 提供；未安装时 None，底座恒走透传）。
+# 契约：handle_builtin_request(payload, headers, client, config) -> dict | Iterator[bytes] | None
+#   None = 非 builtin 模式不接管；dict = 非流式完整 OpenAI response；
+#   Iterator[bytes] = OpenAI SSE chunk 字节流（工具执行进度流）。
+try:
+    from glmrelay.agent.loop import handle_builtin_request as builtin_tool_handler
+except ImportError:
+    builtin_tool_handler = None
+
 
 _CLIENT_DISCONNECTED = (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, socket.timeout)
 RESPONSES_STREAM_HEARTBEAT_SECONDS = 5.0
@@ -404,6 +413,25 @@ class GLM2APIServer:
                         )
                         return
 
+                    # --- P3 模式 B：builtin 工具循环（扩展层未安装或非 builtin 模式时不接管）---
+                    if builtin_tool_handler is not None and path.endswith("/chat/completions"):
+                        handled = builtin_tool_handler(
+                            payload=payload,
+                            headers={k: v for k, v in self.headers.items()},
+                            client=glm_client,
+                            config=config,
+                        )
+                        if handled is not None:
+                            if isinstance(handled, dict):
+                                self._write_json(HTTPStatus.OK, handled)
+                            else:
+                                self._stream_builtin_chunks(handled)
+                            request_store.add(RequestRecord(
+                                method="POST", path=path, model=str(payload.get("model", "")),
+                                status=200, duration_ms=(time.time() - _start) * 1000,
+                            ))
+                            return
+
                     if payload.get("stream"):
                         self._stream_completion(payload)
                         return
@@ -585,6 +613,58 @@ class GLM2APIServer:
             # ---- Chat completions (original) ----
 
             STREAM_HEARTBEAT_SECONDS = 25.0
+
+            def _stream_builtin_chunks(self, chunk_iter) -> None:
+                """P3 模式 B：把 builtin 循环产出的 chunk 流泵给客户端。
+
+                与 _stream_completion 同构的线程 + 心跳形态 —— 工具执行最长
+                GLM_SHELL_TIMEOUT_SECONDS，期间无 chunk 产出，心跳必须继续
+                兜底（否则撞客户端 idle timeout）。
+                """
+                self.send_response(HTTPStatus.OK)
+                self._send_common_headers()
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "close")
+                self.end_headers()
+
+                chunk_queue: queue.Queue[object] = queue.Queue()
+                sentinel = object()
+
+                def read_loop() -> None:
+                    try:
+                        for chunk in chunk_iter:
+                            if chunk:
+                                chunk_queue.put(chunk)
+                    except BaseException as exc:  # noqa: BLE001  异常经队列转写为 5xx
+                        chunk_queue.put(exc)
+                    finally:
+                        chunk_queue.put(sentinel)
+
+                threading.Thread(target=read_loop, daemon=True).start()
+
+                try:
+                    while True:
+                        try:
+                            queued = chunk_queue.get(timeout=RESPONSES_STREAM_HEARTBEAT_SECONDS)
+                        except queue.Empty:
+                            self.wfile.write(b": keepalive\n\n")
+                            self.wfile.flush()
+                            continue
+                        if queued is sentinel:
+                            break
+                        if isinstance(queued, BaseException):
+                            raise queued
+                        self.wfile.write(queued)
+                        self.wfile.flush()
+                except _CLIENT_DISCONNECTED as exc:
+                    logger.warning("客户端在 builtin 流式响应中断开 error=%s", exc)
+                except Exception as exc:
+                    logger.error("builtin 流式响应失败 error=%s\n%s", exc, traceback.format_exc())
+                    self._safe_write_json(
+                        HTTPStatus.BAD_GATEWAY,
+                        {"error": {"message": str(exc), "type": exc.__class__.__name__}},
+                    )
 
             def _stream_completion(self, payload: dict[str, object]) -> None:
                 model = str(payload.get("model", "unknown"))

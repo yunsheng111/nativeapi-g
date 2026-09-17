@@ -14,6 +14,9 @@ DEFAULT_IMAGE_MODEL_NAME = "glm-image-1"
 DEFAULT_GLM_BASE_URL = "https://chatglm.cn/chatglm"
 GUEST_REFRESH_TOKEN_MARKER = "__glm_guest__"
 DEFAULT_BLOCKED_TOOL_NAMES = ()
+# P3 模式 B 默认只读档（架构设计六章「安全默认值」）：读文件/列目录/搜索/Todo；
+# write_file / edit_file / run_command / delete_file 属写档/执行档，需显式提档。
+DEFAULT_BUILTIN_TOOLS = ("read_file", "list_dir", "grep_files", "todo_write")
 BUILTIN_EXPOSED_MODELS = (
     "cogView-4-250304",
     "glm-5.2",
@@ -174,6 +177,11 @@ class AppConfig:
     glm_stream_max_seconds: int
     glm_account_grace_seconds: int
     glm_min_request_interval_ms: int
+    glm_tool_mode: str
+    glm_builtin_tools: list[str]
+    glm_tool_fs_root: str
+    glm_builtin_max_rounds: int
+    glm_shell_timeout_seconds: float
     blocked_tool_names: list[str]
     exposed_models: list[str]
     model_aliases: dict[str, str]
@@ -326,6 +334,18 @@ def load_config(env_file: str = ".env") -> AppConfig:
         glm_account_grace_seconds=max(0, parse_int(values.get("GLM_ACCOUNT_GRACE_SECONDS"), 600)),
         # P0-8 全局最小间隔节流：相邻请求的上游到达时刻最小间隔（毫秒），0 = 关闭
         glm_min_request_interval_ms=max(0, parse_int(values.get("GLM_MIN_REQUEST_INTERVAL_MS"), 0)),
+        # P3 模式 B：默认透传（工具由客户端执行）；builtin = 中转端 agent loop 闭环。
+        glm_tool_mode=(lambda v: v if v in ("passthrough", "builtin") else "passthrough")(
+            values.get("GLM_TOOL_MODE", "passthrough").strip().lower()
+        ),
+        # 内置工具白名单（物理隔离：名单外的工具不注册）。默认只读档（架构设计六章）。
+        glm_builtin_tools=parse_list(values.get("GLM_BUILTIN_TOOLS"), DEFAULT_BUILTIN_TOOLS),
+        # 文件工具的沙箱根：所有文件操作限制在该目录内（拒绝 .. 逃逸与链接逃逸）。
+        glm_tool_fs_root=values.get("GLM_TOOL_FS_ROOT", "").strip() or os.getcwd(),
+        # builtin 模式单次请求的最大工具轮数（防模型循环调用失控）。
+        glm_builtin_max_rounds=max(1, parse_int(values.get("GLM_BUILTIN_MAX_ROUNDS"), 10)),
+        # Shell 工具超时（秒）。Shell 工具默认不在 GLM_BUILTIN_TOOLS 内，需显式提档。
+        glm_shell_timeout_seconds=max(1.0, parse_float(values.get("GLM_SHELL_TIMEOUT_SECONDS"), 30.0)),
         blocked_tool_names=parse_list(values.get("BLOCKED_TOOL_NAMES"), DEFAULT_BLOCKED_TOOL_NAMES),
         exposed_models=exposed_models,  # type: ignore
         model_aliases=model_aliases,
