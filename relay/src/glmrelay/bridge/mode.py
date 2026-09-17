@@ -1,11 +1,10 @@
-"""工具模式判定（P3，架构设计 3.2 的三层覆盖）。
+"""工具模式判定（P3 三层覆盖 + P5 API Key 绑定档，架构设计 3.2）。
 
 优先级从高到低：
     1. 请求头 X-GLM2API-Tool-Mode: passthrough | builtin（临时覆盖，调试用）
     2. 模型名 @builtin 后缀（glm-4-flash@builtin，单次请求覆盖，客户端免改配置）
-    3. 全局 GLM_TOOL_MODE（默认 passthrough）
-
-API Key 绑定档位属 P5（管理面板工具策略页）范围，此处挂账不实现。
+    3. API Key 绑定档（管理面板按 key 设置；"" = 未绑定）
+    4. 全局 GLM_TOOL_MODE（默认 passthrough）
 
 模式语义（架构设计 3.1）：
     passthrough —— 工具由客户端执行；中转只做协议桥（现状行为）
@@ -25,8 +24,16 @@ def normalize_mode(value: str | None) -> str:
     return lowered if lowered in _VALID_MODES else "passthrough"
 
 
-def resolve_tool_mode(headers: dict[str, str] | None, model: str, global_default: str) -> str:
-    """三层覆盖判定。headers 是大小写不敏感视图或普通 dict（键按原样匹配）。"""
+def resolve_tool_mode(
+    headers: dict[str, str] | None,
+    model: str,
+    global_default: str,
+    key_mode: str = "",
+) -> str:
+    """四层覆盖判定。headers 是大小写不敏感视图或普通 dict（键按原样匹配）。
+
+    key_mode 是请求所用 API Key 上绑定的档位（"" = 未绑定，跳过该层）。
+    """
     header_value = ""
     if headers:
         for key, value in headers.items():
@@ -38,6 +45,10 @@ def resolve_tool_mode(headers: dict[str, str] | None, model: str, global_default
 
     if model and str(model).lower().endswith(BUILTIN_SUFFIX):
         return "builtin"
+
+    bound = str(key_mode or "").strip().lower()
+    if bound in _VALID_MODES:
+        return bound
 
     return normalize_mode(global_default)
 

@@ -24,13 +24,15 @@ NO_STORE_HEADERS = {"Cache-Control": "no-store"}
 # ── API Key record & store ──────────────────────────────────────────────────
 
 class ApiKeyRecord:
-    __slots__ = ("name", "key", "enabled", "created_at")
+    __slots__ = ("name", "key", "enabled", "created_at", "tool_mode")
 
-    def __init__(self, name: str, key: str, enabled: bool = True, created_at: str = "") -> None:
+    def __init__(self, name: str, key: str, enabled: bool = True, created_at: str = "", tool_mode: str = "") -> None:
         self.name = name
         self.key = key
         self.enabled = enabled
         self.created_at = created_at or time.strftime("%Y-%m-%d %H:%M:%S")
+        # P5：该 key 的工具模式绑定（"" = 跟随全局；passthrough | builtin）。
+        self.tool_mode = normalize_key_mode(tool_mode)
 
     def to_dict(self, mask: bool = False) -> dict[str, object]:
         return {
@@ -38,7 +40,18 @@ class ApiKeyRecord:
             "key": _mask(self.key, keep=6) if mask else self.key,
             "enabled": self.enabled,
             "created_at": self.created_at,
+            "tool_mode": self.tool_mode,
         }
+
+
+def normalize_key_mode(value: object) -> str:
+    """API Key 绑定的工具模式只接受三个值，其余一律回落「跟随全局」。
+
+    独立于 bridge.mode.normalize_mode：这里的空串是合法语义（跟随全局），
+    而模式判定里空串等价于未设置。
+    """
+    lowered = str(value or "").strip().lower()
+    return lowered if lowered in ("", "passthrough", "builtin") else ""
 
 
 class ApiKeyStore:
@@ -64,6 +77,15 @@ class ApiKeyStore:
                 return True
         return False
 
+    def find_by_key(self, raw_key: str) -> ApiKeyRecord | None:
+        """按明文 key 反查记录（P5 工具模式绑定用）；未命中或未启用返回 None。"""
+        if not raw_key:
+            return None
+        for rec in self._keys.values():
+            if rec.enabled and rec.key == raw_key:
+                return rec
+        return None
+
     def list_all(self) -> list[dict[str, object]]:
         return [r.to_dict(mask=True) for r in self._keys.values()]
 
@@ -84,6 +106,8 @@ class ApiKeyStore:
             rec.key = str(fields["key"])
         if "enabled" in fields:
             rec.enabled = bool(fields["enabled"])
+        if "tool_mode" in fields:
+            rec.tool_mode = normalize_key_mode(fields["tool_mode"])
         return True
 
     def to_json(self) -> str:
@@ -103,6 +127,7 @@ class ApiKeyStore:
                 key=str(item.get("key", "")),
                 enabled=bool(item.get("enabled", True)),
                 created_at=str(item.get("created_at", "")),
+                tool_mode=str(item.get("tool_mode", "")),
             )
 
 
@@ -551,7 +576,7 @@ def handle_admin_api_key_create(handler) -> None:
     if store.get(name):
         _write_admin_json(handler, _api_err(f"API Key '{name}' 已存在"), HTTPStatus.CONFLICT)
         return
-    rec = ApiKeyRecord(name=name, key=key)
+    rec = ApiKeyRecord(name=name, key=key, tool_mode=str(body.get("tool_mode") or ""))
     store.add(rec)
     _persist_api_keys(handler)
     _write_admin_json(handler, _api_ok(rec.to_dict(mask=True), "已创建"))
@@ -572,6 +597,10 @@ def handle_admin_api_key_update(handler, name: str) -> None:
         fields["key"] = k
     if "enabled" in body:
         fields["enabled"] = bool(body["enabled"])
+    if "tool_mode" in body:
+        # 非法值由 normalize_key_mode 统一回落「跟随全局」，不在这里报错——
+        # 面板下拉只提供合法值，直接改 API 的脏输入按宽容语义处理。
+        fields["tool_mode"] = str(body["tool_mode"])
     if not store.update(name, **fields):
         _write_admin_json(handler, _api_err(f"API Key '{name}' 不存在"), HTTPStatus.NOT_FOUND)
         return

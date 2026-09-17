@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
 from dataclasses import dataclass
@@ -105,6 +106,27 @@ def parse_list(value: str | None, default: tuple[str, ...] = ()) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
+def parse_json_list(value: str | None, default: list | None = None) -> list:
+    """解析 JSON 数组形态的环境变量（GLM_MCP_SERVERS 等）；坏 JSON 静默回落默认值。
+
+    静默回落是有意的：配置写坏不该让整个服务起不来，MCP 属可选增强能力，
+    解析失败打不出这里的日志（load_config 无 logger 上下文），由消费方
+    （mcp.py）在拿到空列表时自行说明。裸 JSON 对象（单服务器写法）自动
+    包装成单元素数组 —— 减少一层最常见的手写失误。
+    """
+    if value is None or not value.strip():
+        return list(default) if default is not None else []
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return list(default) if default is not None else []
+    if isinstance(parsed, dict):
+        parsed = [parsed]
+    if not isinstance(parsed, list):
+        return list(default) if default is not None else []
+    return parsed
+
+
 def load_refresh_tokens(token_file_path: Path) -> list[str]:
     if not token_file_path.exists():
         return []
@@ -182,6 +204,16 @@ class AppConfig:
     glm_tool_fs_root: str
     glm_builtin_max_rounds: int
     glm_shell_timeout_seconds: float
+    # ── P4 模式 B 扩展工具：浏览器 / MCP / Skill ──────────────────────────
+    glm_tool_browser_headless: bool
+    glm_tool_browser_allow_private: bool
+    glm_tool_browser_timeout_seconds: float
+    glm_tool_browser_max_chars: int
+    glm_mcp_servers: list[dict]
+    glm_mcp_tools: str
+    glm_mcp_timeout_seconds: float
+    glm_mcp_start_timeout_seconds: float
+    glm_skills_dirs: list[str]
     blocked_tool_names: list[str]
     exposed_models: list[str]
     model_aliases: dict[str, str]
@@ -346,6 +378,24 @@ def load_config(env_file: str = ".env") -> AppConfig:
         glm_builtin_max_rounds=max(1, parse_int(values.get("GLM_BUILTIN_MAX_ROUNDS"), 10)),
         # Shell 工具超时（秒）。Shell 工具默认不在 GLM_BUILTIN_TOOLS 内，需显式提档。
         glm_shell_timeout_seconds=max(1.0, parse_float(values.get("GLM_SHELL_TIMEOUT_SECONDS"), 30.0)),
+        # ── P4 模式 B 扩展工具 ────────────────────────────────────────────
+        # 浏览器工具：专用独立实例（不碰 chatglm 登录 profile），默认无头。
+        glm_tool_browser_headless=parse_bool(values.get("GLM_TOOL_BROWSER_HEADLESS"), True),
+        # 浏览器导航默认拒绝环回/私网地址（防提示注入后探测内网）；环回无条件拒绝。
+        glm_tool_browser_allow_private=parse_bool(values.get("GLM_TOOL_BROWSER_ALLOW_PRIVATE"), False),
+        glm_tool_browser_timeout_seconds=max(5.0, parse_float(values.get("GLM_TOOL_BROWSER_TIMEOUT_SECONDS"), 45.0)),
+        glm_tool_browser_max_chars=max(1000, parse_int(values.get("GLM_TOOL_BROWSER_MAX_CHARS"), 18000)),
+        # MCP 服务器清单：JSON 数组 [{"name":...,"command":...,"args":[...],"env":{...}}]。
+        # 配置了服务器即启用其工具（用户显式选择信任），GLM_MCP_TOOLS glob 可再收窄。
+        glm_mcp_servers=[
+            item for item in parse_json_list(values.get("GLM_MCP_SERVERS"))
+            if isinstance(item, dict) and str(item.get("name", "")).strip() and str(item.get("command", "")).strip()
+        ],
+        glm_mcp_tools=values.get("GLM_MCP_TOOLS", "*").strip() or "*",
+        glm_mcp_timeout_seconds=max(1.0, parse_float(values.get("GLM_MCP_TIMEOUT_SECONDS"), 30.0)),
+        glm_mcp_start_timeout_seconds=max(1.0, parse_float(values.get("GLM_MCP_START_TIMEOUT_SECONDS"), 15.0)),
+        # 技能目录（SKILL.md 所在）：额外的搜索路径，固定目录 .glmrelay/skills 恒生效。
+        glm_skills_dirs=parse_list(values.get("GLM_SKILLS_DIRS")),
         blocked_tool_names=parse_list(values.get("BLOCKED_TOOL_NAMES"), DEFAULT_BLOCKED_TOOL_NAMES),
         exposed_models=exposed_models,  # type: ignore
         model_aliases=model_aliases,

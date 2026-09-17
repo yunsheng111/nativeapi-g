@@ -68,6 +68,10 @@ def build_builtin_registry(config) -> ToolRegistry:
 
     工厂表延迟导入 —— 名单外的工具模块不加载（shell 不在默认名单时，
     subprocess 相关代码完全不上进程）。
+
+    例外是 MCP（P4）：工具名是运行时从各服务器拉取的动态集合，无法预先写进
+    静态名单 —— 「配置了服务器即视为显式启用」（与把名字写进 GLM_BUILTIN_TOOLS
+    是同等级的用户动作），GLM_MCP_TOOLS glob 提供二次收窄。
     """
     from glmrelay.tools.fs import TOOL_FACTORIES as FS_FACTORIES
     from glmrelay.tools.shell import TOOL_FACTORIES as SHELL_FACTORIES
@@ -80,7 +84,27 @@ def build_builtin_registry(config) -> ToolRegistry:
     for factories in (FS_FACTORIES, SHELL_FACTORIES, TODO_FACTORIES):
         for name, factory in factories.items():
             builders[name] = (lambda f=factory, c=config: f(c))
-    return build_registry(list(config.glm_builtin_tools), builders)
+
+    # P4 扩展工具：browser / skills 同样走静态名单（默认不在名单内，需显式启用）
+    from glmrelay.tools.browser import TOOL_FACTORIES as BROWSER_FACTORIES
+    from glmrelay.tools.skills import TOOL_FACTORIES as SKILLS_FACTORIES
+
+    for factories in (BROWSER_FACTORIES, SKILLS_FACTORIES):
+        for name, factory in factories.items():
+            builders[name] = (lambda f=factory, c=config: f(c))
+
+    # P4 MCP：动态工具名（mcp__<server>__<tool>），配置了服务器才注册
+    enabled_names = list(config.glm_builtin_tools)
+    servers = list(getattr(config, "glm_mcp_servers", None) or [])
+    if servers:
+        from glmrelay.tools.mcp import build_mcp_factories
+
+        mcp_factories = build_mcp_factories(config)
+        for name, factory in mcp_factories.items():
+            builders[name] = (lambda f=factory, c=config: f(c))
+        enabled_names.extend(mcp_factories)
+
+    return build_registry(enabled_names, builders)
 
 
 def run_builtin_agent(
@@ -210,16 +234,23 @@ def aggregate_builtin_response(stream: Iterator[bytes]) -> dict:
     }
 
 
-def handle_builtin_request(payload: dict, headers: dict, client: GLMWebClient, config):
-    """底座 server.py 的 chat/completions 扩展点（P3）。
+def handle_builtin_request(
+    payload: dict,
+    headers: dict,
+    client: GLMWebClient,
+    config,
+    key_mode: str = "",
+):
+    """底座 server.py 的 chat/completions 扩展点（P3；P5 起支持 key 绑定档）。
 
-    按 3.2 三层覆盖判定工具模式：非 builtin 返回 None（底座走透传）；
+    按四层覆盖判定工具模式：非 builtin 返回 None（底座走透传）；
     builtin 返回 dict（非流式完整 response）或 Iterator[bytes]（SSE 进度流）。
+    key_mode 是请求所用 API Key 上绑定的档位（"" = 未绑定，跳过该层）。
     客户端声明的 tools 在 builtin 模式下被忽略 —— loop 是同步闭环，无法
     等待客户端回传结果；忽略时记日志说明（失败不伪装）。
     """
     requested_model = str(payload.get("model", ""))
-    mode = resolve_tool_mode(headers, requested_model, config.glm_tool_mode)
+    mode = resolve_tool_mode(headers, requested_model, config.glm_tool_mode, key_mode=key_mode)
     if mode != "builtin":
         return None
     if payload.get("tools"):

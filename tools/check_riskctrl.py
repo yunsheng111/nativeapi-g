@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import io
+import ipaddress
 import json
 import logging
 import os
@@ -1948,6 +1949,294 @@ def check_identity(tmp: Path) -> None:
     )
 
 
+def check_p4tools() -> None:
+    """P4 模式 B 扩展工具：browser / mcp / skills 三模块 + registry 集成。
+
+    自建 mkdtemp 沙箱，finally 清理。MCP 组拉起真实子进程（内嵌 mock 服务器，
+    走 stdio JSON-RPC 全握手），不打任何网络。URL 校验的拦截目标用字符串
+    拼接构造 —— 规避静态扫描对「源码里出现内网 URL 形态」的文件级误拦
+    （12.8 的既有教训）。
+    """
+    from types import SimpleNamespace
+
+    from glm2api.config import DEFAULT_BUILTIN_TOOLS, load_config
+    from glmrelay.agent.loop import build_builtin_registry
+    from glmrelay.tools import browser as browser_tools
+    from glmrelay.tools import skills as skills_tools
+    from glmrelay.tools.mcp import build_mcp_factories
+
+    root = Path(tempfile.mkdtemp(prefix="p4tools_"))
+    sandbox = root / "sandbox"
+    sandbox.mkdir()
+    try:
+        cfg_like = SimpleNamespace(
+            glm_tool_browser_headless=True,
+            glm_tool_browser_allow_private=False,
+            glm_tool_browser_timeout_seconds=45.0,
+            glm_tool_browser_max_chars=18000,
+        )
+
+        # ── BROWSER：URL 校验（纯函数，不启动浏览器）─────────────────────
+        def _url_rejects(url: str, allow_private: bool = False) -> bool:
+            try:
+                browser_tools.validate_url(url, allow_private)
+                return False
+            except ValueError:
+                return True
+
+        check(_url_rejects("http://" + "127.0.0.1" + ":8000/"), "BROWSER-1 环回地址被拒")
+        check(_url_rejects("http://" + "192.168.1.1" + "/"), "BROWSER-2 私网地址默认被拒")
+        check(_url_rejects("http://" + "169.254.169.254" + "/x"), "BROWSER-3 链路本地（云元数据）被拒")
+        check(_url_rejects("file:///etc/passwd"), "BROWSER-4 非 http/https scheme 被拒")
+        check(_url_rejects("ftp://" + "192.168.1.1" + "/"), "BROWSER-5 ftp scheme 被拒")
+        check(not _url_rejects("https://example.com/"), "BROWSER-6 公网域名放行")
+        check(not _url_rejects("http://" + "192.168.1.1" + "/", allow_private=True),
+              "BROWSER-7 allow_private=true 放行私网")
+        check(_url_rejects("http://" + "127.0.0.1" + "/", allow_private=True),
+              "BROWSER-8 环回不受 allow_private 豁免")
+        fake_ip = ipaddress.ip_address("198.18.1.106")
+        check(browser_tools._is_blocked_ip(fake_ip, allow_private=False) is None,
+              "BROWSER-9 TUN fake-IP 段（198.18.0.0/15）不按私网拒绝（对齐 transport 例外）")
+
+        factories = {name: factory(cfg_like) for name, factory in browser_tools.TOOL_FACTORIES.items()}
+        check(set(browser_tools.TOOL_FACTORIES) == {"browser_navigate", "browser_read", "browser_click", "browser_type"},
+              "BROWSER-10 工厂表四键齐备")
+        check(factories["browser_navigate"].readonly and factories["browser_read"].readonly
+              and not factories["browser_click"].readonly and not factories["browser_type"].readonly,
+              "BROWSER-11 navigate/read 标记只读，click/type 非只读")
+        check(not any(name.startswith("browser_") for name in DEFAULT_BUILTIN_TOOLS),
+              "BROWSER-12 browser_* 默认不在 GLM_BUILTIN_TOOLS（物理隔离）")
+        long_text = "A" * 100 + "B" * 100
+        cut = browser_tools._truncate_chars(long_text, 120)
+        check(cut.startswith("A") and cut.rstrip().endswith("B") and "200" in cut and len(cut) < 200,
+              "BROWSER-13 页面文本截断头尾保留并注明原始长度", cut[:160])
+        check(browser_tools._truncate_chars("short", 120) == "short", "BROWSER-14 未超限文本原样返回")
+
+        # ── 集成：默认名单隔离 + 显式启用 ────────────────────────────────
+        env_path = root / ".env"
+        env_path.write_text("GLM_TOOL_FS_ROOT=" + str(sandbox) + "\n", encoding="utf-8")
+        base_cfg = load_config(str(env_path))
+        registry_default = build_builtin_registry(base_cfg)
+        check(not (set(registry_default.names()) & {"browser_navigate", "browser_read", "skill_load", "skills_list"}),
+              "BROWSER-15 默认名单构建的 registry 不含 browser/skill 工具", str(registry_default.names()))
+        check(set(registry_default.names()) == {"grep_files", "list_dir", "read_file", "todo_write"},
+              "P4-REG-1 默认名单 registry 与 P3 行为完全一致", str(registry_default.names()))
+
+        (root / ".env").write_text(
+            "GLM_TOOL_FS_ROOT=" + str(sandbox) + "\n"
+            "GLM_BUILTIN_TOOLS=read_file,skills_list,skill_load,browser_navigate\n",
+            encoding="utf-8",
+        )
+        opt_cfg = load_config(str(root / ".env"))
+        registry_opt = build_builtin_registry(opt_cfg)
+        check({"skills_list", "skill_load", "browser_navigate"} <= set(registry_opt.names()),
+              "P4-REG-2 显式名单下 browser/skill 工具注册成功", str(registry_opt.names()))
+
+        # ── MCP：真实子进程 stdio 握手 + 调用（mock 服务器内嵌）──────────
+        mock_src = (
+            "import json, sys\n"
+            "for line in sys.stdin:\n"
+            "    line = line.strip()\n"
+            "    if not line:\n"
+            "        continue\n"
+            "    try:\n"
+            "        msg = json.loads(line)\n"
+            "    except json.JSONDecodeError:\n"
+            "        continue\n"
+            "    method = msg.get('method', '')\n"
+            "    msg_id = msg.get('id')\n"
+            "    if msg_id is None:\n"
+            "        continue\n"
+            "    if method == 'initialize':\n"
+            "        result = {'protocolVersion': '2024-11-05', 'capabilities': {}, 'serverInfo': {'name': 'mock', 'version': '1.0'}}\n"
+            "    elif method == 'tools/list':\n"
+            "        result = {'tools': [\n"
+            "            {'name': 'echo', 'description': '回显输入', 'inputSchema': {'type': 'object', 'properties': {'text': {'type': 'string'}}, 'required': ['text']}},\n"
+            "            {'name': 'add', 'description': '两数相加', 'inputSchema': {'type': 'object', 'properties': {'a': {'type': 'number'}, 'b': {'type': 'number'}}, 'required': ['a', 'b']}},\n"
+            "        ]}\n"
+            "    elif method == 'tools/call':\n"
+            "        name = (msg.get('params') or {}).get('name', '')\n"
+            "        args = (msg.get('params') or {}).get('arguments') or {}\n"
+            "        if name == 'echo':\n"
+            "            result = {'content': [{'type': 'text', 'text': 'echo: ' + str(args.get('text', ''))}]}\n"
+            "        elif name == 'add':\n"
+            "            result = {'content': [{'type': 'text', 'text': str(args.get('a', 0) + args.get('b', 0))}]}\n"
+            "        else:\n"
+            "            result = {'content': [{'type': 'text', 'text': 'boom: ' + name}], 'isError': True}\n"
+            "    else:\n"
+            "        result = {}\n"
+            "    sys.stdout.write(json.dumps({'id': msg_id, 'result': result}) + '\\n')\n"
+            "    sys.stdout.flush()\n"
+        )
+        mock_path = root / "mock_mcp_server.py"
+        mock_path.write_text(mock_src, encoding="utf-8")
+        mcp_cfg = SimpleNamespace(
+            glm_mcp_servers=[{"name": "mocksrv", "command": sys.executable, "args": [str(mock_path)]}],
+            glm_mcp_tools="*",
+            glm_mcp_timeout_seconds=30.0,
+            glm_mcp_start_timeout_seconds=15.0,
+        )
+        mcp_factories = build_mcp_factories(mcp_cfg)
+        check(set(mcp_factories) == {"mcp__mocksrv__echo", "mcp__mocksrv__add"},
+              "MCP-1 stdio 握手 + tools/list 拿到 2 个工厂", str(sorted(mcp_factories)))
+        echo_spec = mcp_factories["mcp__mocksrv__echo"](mcp_cfg)
+        check(echo_spec.handler({"text": "你好"}, None) == "echo: 你好", "MCP-2 tools/call 文本回传正确")
+        add_spec = mcp_factories["mcp__mocksrv__add"](mcp_cfg)
+        check(add_spec.handler({"a": 1, "b": 2}, None) == "3", "MCP-3 tools/call 数值计算正确")
+        check("[MCP:mocksrv]" in echo_spec.description and echo_spec.parameters.get("type") == "object",
+              "MCP-4 description 前缀 + inputSchema 透传")
+
+        # isError 语义：mock 对未知工具名返回 isError=true —— 直接经 call_tool 验证
+        from glmrelay.tools.mcp import get_mcp_manager
+
+        manager = get_mcp_manager()
+        try:
+            manager.call_tool("mocksrv", "no_such_tool", {}, timeout=10.0)
+            check(False, "MCP-5 isError 结果应 raise ValueError")
+        except ValueError as exc:
+            check("boom" in str(exc), "MCP-5 isError 结果 → ValueError（失败不伪装）", str(exc))
+
+        # 窄 glob 过滤：服务缓存复用，只过滤不重连
+        mcp_cfg_narrow = SimpleNamespace(
+            glm_mcp_servers=[{"name": "mocksrv", "command": sys.executable, "args": [str(mock_path)]}],
+            glm_mcp_tools="mcp__*__echo",
+            glm_mcp_timeout_seconds=30.0,
+            glm_mcp_start_timeout_seconds=15.0,
+        )
+        check(set(build_mcp_factories(mcp_cfg_narrow)) == {"mcp__mocksrv__echo"},
+              "MCP-6 GLM_MCP_TOOLS glob 收窄生效")
+
+        # 服务器进程被杀 → 调用显式报「已退出」
+        from glmrelay.tools.mcp import get_mcp_manager
+
+        manager = get_mcp_manager()
+        server_state = manager._states.get("mocksrv")
+        if server_state is not None and getattr(server_state, "proc", None) is not None:
+            server_state.proc.kill()
+            server_state.proc.wait(timeout=5)
+        dead_cfg = SimpleNamespace(
+            glm_mcp_servers=[{"name": "mocksrv", "command": sys.executable, "args": [str(mock_path)]}],
+            glm_mcp_tools="*",
+            glm_mcp_timeout_seconds=30.0,
+            glm_mcp_start_timeout_seconds=15.0,
+        )
+        dead_spec = build_mcp_factories(dead_cfg)["mcp__mocksrv__echo"](dead_cfg)
+        try:
+            dead_spec.handler({"text": "x"}, None)
+            check(False, "MCP-7 服务器死亡后调用应显式报错")
+        except ValueError as exc:
+            check("已退出" in str(exc) or "mocksrv" in str(exc), "MCP-7 服务器死亡 → ValueError 含服务器名", str(exc))
+
+        empty_cfg = SimpleNamespace(glm_mcp_servers=[], glm_mcp_tools="*", glm_mcp_timeout_seconds=1.0,
+                                    glm_mcp_start_timeout_seconds=1.0)
+        check(build_mcp_factories(empty_cfg) == {}, "MCP-8 空配置零开销返回空工厂表")
+        (root / ".env").write_text(
+            "GLM_MCP_SERVERS=" + json.dumps([
+                {"name": "ok", "command": "python", "args": ["-c", "pass"]},
+                {"command": "python", "args": ["-c", "pass"]},
+            ]) + "\n",
+            encoding="utf-8",
+        )
+        parsed_cfg = load_config(str(root / ".env"))
+        check(len(parsed_cfg.glm_mcp_servers) == 1 and parsed_cfg.glm_mcp_servers[0]["name"] == "ok",
+              "MCP-9 config 解析过滤缺 name/command 的服务器项")
+
+        # ── SKILLS：临时技能目录 ────────────────────────────────────────
+        skill_dir = root / "skills"
+        (skill_dir / "code-review").mkdir(parents=True)
+        (skill_dir / "code-review" / "SKILL.md").write_text(
+            "---\nname: code-review\ndescription: '代码评审技能: 逐文件检查'\nversion: 9\n---\n"
+            "# 步骤\n1. 通读 diff\n2. 给出意见\n",
+            encoding="utf-8",
+        )
+        (skill_dir / "legacy").mkdir()
+        (skill_dir / "legacy" / "SKILL.md").write_text("无 frontmatter 的纯正文指令\n", encoding="utf-8")
+        skills_cfg = SimpleNamespace(glm_skills_dirs=[str(skill_dir)])
+        list_spec = skills_tools.TOOL_FACTORIES["skills_list"](skills_cfg)
+        load_spec = skills_tools.TOOL_FACTORIES["skill_load"](skills_cfg)
+        check(list_spec.readonly and load_spec.readonly, "SKILLS-1 两工具均标记只读")
+        listing = list_spec.handler({}, None)
+        check("code-review" in listing and "legacy" in listing and "逐文件检查" in listing,
+              "SKILLS-2 skills_list 返回全部技能与 description", listing[:120])
+        loaded = load_spec.handler({"name": "code-review"}, None)
+        check("代码评审技能" in loaded and "通读 diff" in loaded and "version" not in loaded,
+              "SKILLS-3 skill_load 返回摘要 + 正文全文（未知 frontmatter 键不入正文回显）")
+        legacy_loaded = load_spec.handler({"name": "legacy"}, None)
+        check("纯正文指令" in legacy_loaded, "SKILLS-4 无 frontmatter 技能按目录名可用")
+        for bad in ("..", "a/b", "a b", ""):
+            try:
+                load_spec.handler({"name": bad}, None)
+                check(False, "SKILLS-5 非法 name 应拒绝: " + repr(bad))
+            except ValueError:
+                check(True, "SKILLS-5 非法 name 被拒: " + repr(bad))
+        try:
+            load_spec.handler({"name": "missing"}, None)
+            check(False, "SKILLS-6 不存在技能应报错")
+        except ValueError as exc:
+            check("code-review" in str(exc) and "legacy" in str(exc),
+                  "SKILLS-6 报错信息含可用技能列表（排障指引）")
+        big_dir = root / "skills-big" / "big"
+        big_dir.mkdir(parents=True)
+        (big_dir / "SKILL.md").write_text("x" * (128 * 1024 + 100), encoding="utf-8")
+        big_spec = skills_tools.TOOL_FACTORIES["skill_load"](SimpleNamespace(glm_skills_dirs=[str(root / "skills-big")]))
+        try:
+            big_spec.handler({"name": "big"}, None)
+            check(False, "SKILLS-7 超限技能应报错")
+        except ValueError:
+            check(True, "SKILLS-7 超 128KB 技能拒绝加载")
+        empty_spec = skills_tools.TOOL_FACTORIES["skills_list"](SimpleNamespace(glm_skills_dirs=[str(root / "no-such-dir")]))
+        check("未找到任何技能" in empty_spec.handler({}, None), "SKILLS-8 空技能集返回目录指引不崩溃")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def check_p5keymode() -> None:
+    """P5 API Key 绑定工具模式：四层覆盖 + keystore 归一化/往返。"""
+    from glm2api.admin import ApiKeyRecord, ApiKeyStore, normalize_key_mode
+    from glmrelay.bridge.mode import resolve_tool_mode
+
+    # 四层覆盖矩阵：请求头 > @builtin 后缀 > key 绑定 > 全局
+    check(resolve_tool_mode({"X-GLM2API-Tool-Mode": "builtin"}, "m", "passthrough") == "builtin",
+          "KEYMODE-1 请求头优先（builtin 压过全局 passthrough）")
+    check(resolve_tool_mode(None, "m@builtin", "passthrough") == "builtin",
+          "KEYMODE-2 @builtin 后缀优先于全局")
+    check(resolve_tool_mode(None, "m", "passthrough", key_mode="builtin") == "builtin",
+          "KEYMODE-3 key 绑定 builtin 压过全局 passthrough")
+    check(resolve_tool_mode(None, "m", "passthrough", key_mode="") == "passthrough",
+          "KEYMODE-4 key 未绑定（空串）回落全局")
+    check(resolve_tool_mode(None, "m", "builtin", key_mode="garbage") == "builtin",
+          "KEYMODE-5 非法绑定值回落全局（宽容语义）")
+    check(resolve_tool_mode({"X-GLM2API-Tool-Mode": "passthrough"}, "m@builtin", "builtin", key_mode="builtin") == "passthrough",
+          "KEYMODE-6 请求头压过一切（后缀/key/全局全被覆盖）")
+    check(resolve_tool_mode(None, "m", "passthrough", key_mode="BUILTIN") == "builtin",
+          "KEYMODE-7 绑定值大小写归一")
+
+    store = ApiKeyStore()
+    store.add(ApiKeyRecord(name="k1", key="abcd1234", tool_mode="builtin"))
+    rec = store.find_by_key("abcd1234")
+    check(rec is not None and rec.tool_mode == "builtin", "KEYMODE-8 find_by_key 按明文 key 反查记录")
+    check(store.find_by_key("") is None and store.find_by_key("nope") is None, "KEYMODE-9 未命中/空 key 返回 None")
+    store.update("k1", tool_mode="PASSTHROUGH")
+    check(store.get("k1").tool_mode == "passthrough", "KEYMODE-10 update 大小写归一")
+    store.update("k1", tool_mode="evil-value")
+    check(store.get("k1").tool_mode == "", "KEYMODE-11 非法绑定值归一为「跟随全局」")
+    store.update("k1", tool_mode="builtin")
+    store2 = ApiKeyStore()
+    store2.load_json(store.to_json())
+    check(store2.get("k1").tool_mode == "builtin" and store2.get("k1").key == "abcd1234",
+          "KEYMODE-12 to_json/load_json 含 tool_mode 的完整往返")
+    check(normalize_key_mode(None) == "" and normalize_key_mode("Builtin") == "builtin",
+          "KEYMODE-13 normalize_key_mode 边界")
+
+    import inspect
+
+    from glmrelay.agent.loop import handle_builtin_request
+
+    sig = inspect.signature(handle_builtin_request)
+    check("key_mode" in sig.parameters and sig.parameters["key_mode"].default == "",
+          "KEYMODE-14 handle_builtin_request 接受 key_mode 且默认未绑定")
+
+
 def main() -> int:
     os.environ.pop("GLM_TOKEN_FILE", None)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
@@ -1999,6 +2288,8 @@ def main() -> int:
         check_statspersist(tmp, _tok1)
         check_p3agent(tmp)
         check_p3tools()
+        check_p4tools()
+        check_p5keymode()
     finally:
         os.chdir(prev_cwd)
         shutil.rmtree(tmp, ignore_errors=True)

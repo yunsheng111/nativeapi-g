@@ -415,11 +415,13 @@ class GLM2APIServer:
 
                     # --- P3 模式 B：builtin 工具循环（扩展层未安装或非 builtin 模式时不接管）---
                     if builtin_tool_handler is not None and path.endswith("/chat/completions"):
+                        _key_rec = self._resolve_api_key_record()
                         handled = builtin_tool_handler(
                             payload=payload,
                             headers={k: v for k, v in self.headers.items()},
                             client=glm_client,
                             config=config,
+                            key_mode=(_key_rec.tool_mode if _key_rec is not None else ""),
                         )
                         if handled is not None:
                             if isinstance(handled, dict):
@@ -733,6 +735,23 @@ class GLM2APIServer:
                 logger.info("流式请求完成 model=%s", model)
 
             # ---- Auth ----
+
+            def _resolve_api_key_record(self):
+                """解析请求携带的 API Key 对应的结构化记录（P5 工具模式绑定用）。
+
+                legacy SERVER_API_KEYS 是纯字符串清单、无逐 key 元数据，恒返回
+                None —— 需要绑定工具模式的 key 应在管理面板创建（结构化存储）。
+                """
+                store: ApiKeyStore = self._admin_api_key_store
+                authorization = self.headers.get("Authorization", "")
+                if authorization.startswith("Bearer "):
+                    rec = store.find_by_key(authorization[7:].strip())
+                    if rec is not None:
+                        return rec
+                x_api_key = self.headers.get("x-api-key", "")
+                if x_api_key:
+                    return store.find_by_key(x_api_key.strip())
+                return None
 
             def _authorize(self) -> bool:
                 # Check legacy SERVER_API_KEYS first
