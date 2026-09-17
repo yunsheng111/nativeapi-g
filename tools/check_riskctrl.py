@@ -1387,6 +1387,117 @@ def check_p11(tmp: Path) -> None:
     check(not hits, "GH2 已跟踪文件零抓包产物命中", ", ".join(hits[:5]))
 
 
+def check_statspersist(tmp: Path, tok1: str) -> None:
+    """P2 收尾小批：运行统计事件驱动持久化（P2-5，不做 debounce）。
+
+    SP-a（钩子安装形态断言）在 main() 里 import glmrelay 后立即执行；
+    本组随后各场景自行临时安装/恢复钩子。
+    """
+    import threading as th
+    from glm2api.config import load_config
+    from glm2api.services.glm_auth import GLMAccessTokenManager
+
+    # SP-b 统计变更点触发 listener：快照含累计计数（临时替换，测完恢复）
+    captured: list[tuple[int, dict]] = []
+    prev_listener = GLMAccessTokenManager.stats_persist_listener
+    prev_provider = GLMAccessTokenManager.stats_restore_provider
+    try:
+        GLMAccessTokenManager.stats_persist_listener = lambda i, snap: captured.append((i, snap))
+        GLMAccessTokenManager.stats_restore_provider = None
+        cfg = load_config(str(tmp / ".env"))
+        mgr = GLMAccessTokenManager(cfg, logging.getLogger("check_sp"))
+        mgr.record_request(0)
+        mgr.record_result(0, False, "boom")
+        mgr.record_probe_result(0, False, "probe: x")
+        check(len(captured) >= 3, "SP-b-a record_request/result/probe 各触发一次落盘通报", str(len(captured)))
+        last = captured[-1][1]
+        check(
+            last.get("total_requests") == 1 and last.get("total_failures") == 1 and last.get("probe_failures") == 1,
+            "SP-b-b 快照含累计计数与观测字段",
+            str(last),
+        )
+        # 钩子抛异常不阻断统计主流程
+        def broken_listener(index, snapshot):
+            raise RuntimeError("disk full")
+
+        GLMAccessTokenManager.stats_persist_listener = broken_listener
+        mgr.record_request(0)
+        check(mgr.get_account_stats()[0]["total_requests"] == 2, "SP-b-c 落盘失败不影响内存统计")
+    finally:
+        GLMAccessTokenManager.stats_persist_listener = prev_listener
+        GLMAccessTokenManager.stats_restore_provider = prev_provider
+
+    # SP-c 启动回填：restore_provider 提供的快照回填白名单字段；时间性状态不回填
+    def fake_provider(index: int) -> dict:
+        return {
+            "total_requests": 42,
+            "total_failures": 7,
+            "last_error": "历史错误",
+            "breaker_until": 12345.0,  # 白名单外：不得回填
+            "cooldown_until": 6789.0,
+        }
+
+    prev_listener2 = GLMAccessTokenManager.stats_persist_listener
+    GLMAccessTokenManager.stats_restore_provider = fake_provider
+    try:
+        mgr2 = GLMAccessTokenManager(load_config(str(tmp / ".env")), logging.getLogger("check_sp2"))
+        row = mgr2.get_account_stats()[0]
+        check(
+            row["total_requests"] == 42 and row["total_failures"] == 7,
+            "SP-c-a 累计计数跨进程回填",
+            str(row),
+        )
+        acc2 = mgr2._accounts[0]
+        check(
+            acc2.breaker_until == 0.0 and acc2.cooldown_until == 0.0,
+            "SP-c-b 时间性状态（熔断/冷却）不跨进程恢复（重启即新鲜状态）",
+        )
+    finally:
+        GLMAccessTokenManager.stats_restore_provider = prev_provider
+        GLMAccessTokenManager.stats_persist_listener = prev_listener2
+
+    # SP-d TokenStore stats 旁挂：index→指纹翻译 + 原子写读一致 + 越界安全
+    from glmrelay.accounts.store import TokenStore
+
+    store = TokenStore(tmp / "token.txt")
+    snapshot = {"total_requests": 5, "total_failures": 1, "last_error": "e"}
+    store.record_stats_for_index(0, snapshot)
+    check(store.stats_for_index(0).get("total_requests") == 5, "SP-d-a 写读一致（按 index 翻译指纹）")
+    check(store.stats_for_index(99) == {}, "SP-d-b 越界 index 安全返回空")
+    # token.txt 行序变化（删除首个账号）后旧指纹失配 → 数据不误挂到别的账号
+    store.remove_token(tok1)
+    check(store.stats_for_index(0) in ({}, None) or store.stats_for_index(0).get("total_requests") != 5,
+          "SP-d-c 行序变化后旧数据失配不误挂", str(store.stats_for_index(0)))
+
+    # SP-e 并发写不丢更新（两线程并发写同一 store）
+    errors: list[str] = []
+    def writer(offset: int) -> None:
+        try:
+            for i in range(10):
+                store.record_stats_for_index(1, {"total_requests": offset * 100 + i})
+        except Exception as exc:  # noqa: BLE001
+            errors.append(str(exc))
+
+    threads = [th.Thread(target=writer, args=(k,)) for k in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    check(not errors and store.stats_for_index(1) != {}, "SP-e 并发落盘无异常且文件可读", str(errors))
+
+    # SP-f token 行数不足（游客槽 / env 单账号）→ 槽位键回退，游客部署统计也持久
+    import json as _json
+    store2 = TokenStore(tmp / "guest_token.txt")
+    store2.record_stats_for_index(3, {"total_requests": 9})
+    check(store2.stats_for_index(3).get("total_requests") == 9, "SP-f-a 无 token 行时按槽位键落盘")
+    raw = _json.loads(store2.stats_file.read_text(encoding="utf-8"))
+    check(
+        any(str(key).startswith("idx-") for key in (raw.get("stats") or {})),
+        "SP-f-b 槽位键形态为 idx-N",
+        str(list((raw.get("stats") or {}).keys())),
+    )
+
+
 # --------------------------------------------------------------- P2.5-2 I1 身份字段单一数据源 + 矛盾自检
 
 def check_identity(tmp: Path) -> None:
@@ -1518,6 +1629,18 @@ def main() -> int:
         from glm2api.services.glm_auth import GLMAccessTokenManager
         import glmrelay  # noqa: F401
 
+        # SP-a 先断言扩展层钩子安装形态，随后按"底座独立形态"卸下 stats 两钩子
+        # —— 统计落盘若全程在位，各测试组的 record 调用会经 tmp 的 stats 文件
+        # 相互回填计数，污染 R1/GR1 等从零计数的既有断言（真实部署无此问题：
+        # 回填的就是该部署自己的历史计数）。
+        check(
+            GLMAccessTokenManager.stats_persist_listener is not None
+            and GLMAccessTokenManager.stats_restore_provider is not None,
+            "SP-a stats 持久化钩子已由 glmrelay 安装",
+        )
+        GLMAccessTokenManager.stats_persist_listener = None
+        GLMAccessTokenManager.stats_restore_provider = None
+
         cfg = load_config(str(tmp / ".env"))
         mgr = GLMAccessTokenManager(cfg, logging.getLogger("check_env"))
         check_d4(mgr)
@@ -1540,6 +1663,7 @@ def main() -> int:
         check_p6(tmp)
         check_streamguard()
         check_identity(tmp)
+        check_statspersist(tmp, _tok1)
     finally:
         os.chdir(prev_cwd)
         shutil.rmtree(tmp, ignore_errors=True)

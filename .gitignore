@@ -31,3 +31,7 @@ relay/_cdp_profile_*/
 *.har
 *capture*.jsonl
 Default-*.json
+
+# P2-5 运行统计旁挂（last_error 可能含上游错误详情，与 accounts.json 同级处理）
+accounts_stats.json
+relay/accounts_stats.json

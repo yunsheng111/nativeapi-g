@@ -120,6 +120,22 @@ class GLMAccessTokenManager:
     # (旧 token, 新 token) 通报，用于登记 accounts.json 的别名链，保住挂在旧
     # 指纹上的真实设备身份。底座不感知 accounts.json 的存在。
     token_rotation_listener: Callable[[str, str], None] | None = None
+    # 扩展点（P2-5 运行统计持久化）：统计字段事件驱动落盘 —— 每个统计变更点
+    # 把 (账号 index, 快照 dict) 通报给监听者；restore_provider 在初始化时按
+    # index 取回落盘快照回填。底座不感知落盘位置与格式。
+    stats_persist_listener: Callable[[int, dict], None] | None = None
+    stats_restore_provider: Callable[[int], dict] | None = None
+    # 回填白名单：只恢复累计计数与观测字段；时间性状态（冷却/熔断到期、宽限
+    # 起点）不跨进程恢复 —— 重启即新鲜状态，避免过期阈值复活成陈旧状态。
+    _STATS_RESTORE_FIELDS = (
+        "total_requests",
+        "total_failures",
+        "risk_event_count",
+        "probe_failures",
+        "last_used_at",
+        "last_success_at",
+        "last_error",
+    )
     # 扩展点（P1-b）：glmrelay 的健康探测与管理面板从这里读取活跃实例。
     # 本服务为单实例进程，最后创建者即活跃实例。
     last_instance: "GLMAccessTokenManager | None" = None
@@ -158,6 +174,7 @@ class GLMAccessTokenManager:
         self._current_index = 0
         self._lock = threading.RLock()  # RLock：因为 next_request_id 会在 _refresh_access_token（已持锁）内被调用
         self._persist_lock = threading.Lock()
+        self._restore_stats()
         type(self).last_instance = self
         logger.info(
             "账号管理器初始化 账号数=%s 游客模式=%s 真实设备身份=%s/%s",
@@ -166,6 +183,53 @@ class GLMAccessTokenManager:
             resolved_devices,
             len(self._accounts) - sum(1 for a in self._accounts if a.is_guest),
         )
+
+    # -- 运行统计持久化（P2-5）：事件驱动、低频、无 debounce（账号落盘本就是
+    # 事件驱动形态，12.6 裁决不引入写合并）。IO 在锁外执行，锁内只做快照。
+
+    def _stats_snapshot_locked(self, account_index: int) -> dict | None:
+        if not (0 <= account_index < len(self._accounts)):
+            return None
+        acc = self._accounts[account_index]
+        return {
+            "total_requests": acc.total_requests,
+            "total_failures": acc.total_failures,
+            "risk_event_count": acc.risk_event_count,
+            "probe_failures": acc.probe_failures,
+            "last_used_at": acc.last_used_at,
+            "last_success_at": acc.last_success_at,
+            "last_error": acc.last_error,
+        }
+
+    def _emit_stats(self, account_index: int) -> None:
+        listener = type(self).stats_persist_listener
+        if listener is None:
+            return
+        with self._lock:
+            snapshot = self._stats_snapshot_locked(account_index)
+        if snapshot is None:
+            return
+        try:
+            listener(account_index, snapshot)
+        except Exception as exc:
+            self.logger.warning("运行统计落盘失败 index=%s error=%s", account_index, exc)
+
+    def _restore_stats(self) -> None:
+        provider = type(self).stats_restore_provider
+        if provider is None:
+            return
+        for index in range(len(self._accounts)):
+            try:
+                data = provider(index)
+            except Exception as exc:
+                self.logger.warning("运行统计回填失败 index=%s error=%s", index, exc)
+                continue
+            if not isinstance(data, dict):
+                continue
+            acc = self._accounts[index]
+            for field_name in type(self)._STATS_RESTORE_FIELDS:
+                if field_name in data:
+                    setattr(acc, field_name, data[field_name])
 
     def get_browser_headers(self, app_fr: str = "browser_extension") -> dict[str, str]:
         return {
@@ -526,23 +590,26 @@ class GLMAccessTokenManager:
 
     def register_risk_event(self, account_index: int, exc: Exception) -> bool:
         """记录一次风控事件；累计达阈值进入冷却并轮换设备身份。返回是否触发冷却。"""
-        with self._lock:
-            if not (0 <= account_index < len(self._accounts)):
-                return False
-            acc = self._accounts[account_index]
-            acc.risk_event_count += 1
-            if acc.risk_event_count < RISK_EVENT_THRESHOLD:
-                return False
-            acc.risk_event_count = 0
-            acc.cooldown_until = time.time() + RISK_COOLDOWN_SECONDS
-            old_dev = acc.device_id[:8]
-            acc.device_id = uuid.uuid4().hex
-            acc.cached_token = None
-            self.logger.warning(
-                "account=%s 风控事件累计达阈值，进入冷却 %ss 并轮换 device_id %s → %s（accounts.json 中的真实身份不受影响，重启后回归）",
-                account_index, RISK_COOLDOWN_SECONDS, old_dev, acc.device_id[:8],
-            )
-            return True
+        try:
+            with self._lock:
+                if not (0 <= account_index < len(self._accounts)):
+                    return False
+                acc = self._accounts[account_index]
+                acc.risk_event_count += 1
+                if acc.risk_event_count < RISK_EVENT_THRESHOLD:
+                    return False
+                acc.risk_event_count = 0
+                acc.cooldown_until = time.time() + RISK_COOLDOWN_SECONDS
+                old_dev = acc.device_id[:8]
+                acc.device_id = uuid.uuid4().hex
+                acc.cached_token = None
+                self.logger.warning(
+                    "account=%s 风控事件累计达阈值，进入冷却 %ss 并轮换 device_id %s → %s（accounts.json 中的真实身份不受影响，重启后回归）",
+                    account_index, RISK_COOLDOWN_SECONDS, old_dev, acc.device_id[:8],
+                )
+                return True
+        finally:
+            self._emit_stats(account_index)
 
     def is_account_cooling_down(self, account_index: int) -> bool:
         with self._lock:
@@ -562,11 +629,14 @@ class GLMAccessTokenManager:
         return not self.is_account_cooling_down(account_index) and not self.is_account_breaked(account_index)
 
     def record_request(self, account_index: int) -> None:
-        with self._lock:
-            if 0 <= account_index < len(self._accounts):
-                acc = self._accounts[account_index]
-                acc.total_requests += 1
-                acc.last_used_at = time.time()
+        try:
+            with self._lock:
+                if 0 <= account_index < len(self._accounts):
+                    acc = self._accounts[account_index]
+                    acc.total_requests += 1
+                    acc.last_used_at = time.time()
+        finally:
+            self._emit_stats(account_index)
 
     def record_result(self, account_index: int, ok: bool, error: str = "") -> bool:
         """回填一次上游请求结果（成功=HTTP 建联成功）。返回是否触发熔断摘除。
@@ -575,52 +645,58 @@ class GLMAccessTokenManager:
         通用熔断 —— 新导入账号立即遇网络抖动不应被误摘；风控冷却不受宽限豁免
         （封禁信号不该被宽限吞掉，见 register_risk_event 独立路径）。
         """
-        with self._lock:
-            if not (0 <= account_index < len(self._accounts)):
+        try:
+            with self._lock:
+                if not (0 <= account_index < len(self._accounts)):
+                    return False
+                acc = self._accounts[account_index]
+                if ok:
+                    acc.consecutive_failures = 0
+                    acc.last_success_at = time.time()
+                    acc.last_error = ""
+                    return False
+                acc.total_failures += 1
+                acc.last_error = (error or "")[:200]
+                grace = int(self.config.glm_account_grace_seconds or 0)
+                if grace > 0 and time.time() - acc.created_at < grace:
+                    return False
+                acc.consecutive_failures += 1
+                if acc.consecutive_failures >= BREAKER_FAILURE_THRESHOLD and time.time() >= acc.breaker_until:
+                    acc.breaker_until = time.time() + BREAKER_COOLDOWN_SECONDS
+                    acc.consecutive_failures = 0
+                    self.logger.warning(
+                        "account=%s 连续失败达阈值，熔断摘除 %ss（到期后半开重试）last_error=%s",
+                        account_index, BREAKER_COOLDOWN_SECONDS, acc.last_error,
+                    )
+                    return True
                 return False
-            acc = self._accounts[account_index]
-            if ok:
-                acc.consecutive_failures = 0
-                acc.last_success_at = time.time()
-                acc.last_error = ""
-                return False
-            acc.total_failures += 1
-            acc.last_error = (error or "")[:200]
-            grace = int(self.config.glm_account_grace_seconds or 0)
-            if grace > 0 and time.time() - acc.created_at < grace:
-                return False
-            acc.consecutive_failures += 1
-            if acc.consecutive_failures >= BREAKER_FAILURE_THRESHOLD and time.time() >= acc.breaker_until:
-                acc.breaker_until = time.time() + BREAKER_COOLDOWN_SECONDS
-                acc.consecutive_failures = 0
-                self.logger.warning(
-                    "account=%s 连续失败达阈值，熔断摘除 %ss（到期后半开重试）last_error=%s",
-                    account_index, BREAKER_COOLDOWN_SECONDS, acc.last_error,
-                )
-                return True
-            return False
+        finally:
+            self._emit_stats(account_index)
 
     def record_probe_result(self, account_index: int, ok: bool, error: str = "") -> bool:
         """回填健康探测结果（P1-b）。与请求失败分源计数，达阈值同样熔断摘除。"""
-        with self._lock:
-            if not (0 <= account_index < len(self._accounts)):
+        try:
+            with self._lock:
+                if not (0 <= account_index < len(self._accounts)):
+                    return False
+                acc = self._accounts[account_index]
+                if ok:
+                    acc.probe_failures = 0
+                    return False
+                acc.probe_failures += 1
+                if error:
+                    acc.last_error = error[:200]
+                if acc.probe_failures >= BREAKER_FAILURE_THRESHOLD and time.time() >= acc.breaker_until:
+                    acc.breaker_until = time.time() + BREAKER_COOLDOWN_SECONDS
+                    acc.probe_failures = 0
+                    self.logger.warning(
+                        "account=%s 健康探测连续失败达阈值，判定失效并熔断摘除 %ss",
+                        account_index, BREAKER_COOLDOWN_SECONDS,
+                    )
+                    return True
                 return False
-            acc = self._accounts[account_index]
-            if ok:
-                acc.probe_failures = 0
-                return False
-            acc.probe_failures += 1
-            if error:
-                acc.last_error = error[:200]
-            if acc.probe_failures >= BREAKER_FAILURE_THRESHOLD and time.time() >= acc.breaker_until:
-                acc.breaker_until = time.time() + BREAKER_COOLDOWN_SECONDS
-                acc.probe_failures = 0
-                self.logger.warning(
-                    "account=%s 健康探测连续失败达阈值，判定失效并熔断摘除 %ss",
-                    account_index, BREAKER_COOLDOWN_SECONDS,
-                )
-                return True
-            return False
+        finally:
+            self._emit_stats(account_index)
 
     def get_account_stats(self) -> list[dict[str, object]]:
         """运行时配额视图（管理面板 / 健康探测共用）。"""

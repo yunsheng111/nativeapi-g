@@ -17,6 +17,7 @@ import json
 import os
 import re
 import tempfile
+import threading
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -224,6 +225,10 @@ class TokenStore:
     def __init__(self, token_file: Path, meta_file: Path | None = None) -> None:
         self.token_file = Path(token_file)
         self.meta_file = Path(meta_file) if meta_file else self.token_file.with_name("accounts.json")
+        # 运行统计旁挂（P2-5）：与 accounts.json 同级的独立文件 —— 统计是每请求
+        # 更新的运行时数据，不与身份元数据混写（身份文件只在导入/轮换时变）。
+        self.stats_file = self.token_file.with_name("accounts_stats.json")
+        self._stats_lock = threading.Lock()
 
     # ------------------------------------------------------------ token.txt
 
@@ -399,6 +404,59 @@ class TokenStore:
         meta[old_fp] = old_entry
         self.save_meta(meta)
         return new_entry
+
+    # ---------------------------------------------------------- accounts_stats.json
+
+    def load_stats(self) -> dict[str, dict]:
+        """读运行统计旁挂：token 指纹 -> 统计快照 dict。文件缺失/损坏返回空。"""
+        if not self.stats_file.exists():
+            return {}
+        try:
+            data = json.loads(self.stats_file.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return {}
+        records = data.get("stats", data) if isinstance(data, dict) else {}
+        if not isinstance(records, dict):
+            return {}
+        return {str(key): dict(value) for key, value in records.items() if isinstance(value, dict)}
+
+    def save_stats(self, stats: dict[str, dict]) -> None:
+        payload = {"version": 1, "updated_at": now_iso(), "stats": stats}
+        _atomic_write(self.stats_file, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+
+    def _stats_key(self, account_index: int) -> str | None:
+        """统计键：token 行存在用指纹（与账号内容绑定）；行数不足（游客槽 /
+        env 单账号）回退槽位键 —— 游客身份每进程随机，但「槽位统计」视角
+        仍连续。行序后续扩容后 idx 键的旧数据可能失配，统计非身份关键数据，
+        可接受；负数 index 无意义返回 None。
+        """
+        tokens = self.load_tokens()
+        if 0 <= account_index < len(tokens):
+            return fingerprint(tokens[account_index])
+        if account_index >= 0:
+            return f"idx-{account_index}"
+        return None
+
+    def record_stats_for_index(self, account_index: int, snapshot: dict) -> None:
+        """底座 stats_persist_listener 入口（P2-5）：index 翻译成统计键后落盘。
+
+        锁内读改写防并发丢更新。
+        """
+        with self._stats_lock:
+            key = self._stats_key(account_index)
+            if key is None:
+                return
+            stats = self.load_stats()
+            stats[key] = dict(snapshot)
+            self.save_stats(stats)
+
+    def stats_for_index(self, account_index: int) -> dict:
+        """底座 stats_restore_provider 入口：按 index 回填落盘快照。"""
+        with self._stats_lock:
+            key = self._stats_key(account_index)
+            if key is None:
+                return {}
+            return self.load_stats().get(key, {})
 
     # ------------------------------------------------------------- 组合视图
 

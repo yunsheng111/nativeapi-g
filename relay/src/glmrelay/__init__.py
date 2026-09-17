@@ -51,5 +51,29 @@ def _install_token_rotation_hook() -> None:
         pass
 
 
+def _install_stats_persistence() -> None:
+    """P2-5：运行统计事件驱动落盘 + 启动回填。
+
+    底座在每个统计变更点（请求/结果/探活/风控事件）把 (账号 index, 快照)
+    通报给监听者；restore_provider 在账号管理器初始化时按 index 回填累计
+    计数。键是 token 指纹（index 在账号增删后会漂移），落盘文件
+    accounts_stats.json 与身份元数据分离（运行时数据不污染身份文件）。
+    扩展层可选：安装失败不阻断底座启动，仅退化为统计纯内存态（重启即丢，
+    与 P1-b 之前的行为一致）。
+    """
+    try:
+        from glm2api.services.glm_auth import GLMAccessTokenManager
+
+        from .accounts.registry import _token_file
+        from .accounts.store import TokenStore
+
+        store = TokenStore(_token_file())
+        GLMAccessTokenManager.stats_persist_listener = store.record_stats_for_index
+        GLMAccessTokenManager.stats_restore_provider = store.stats_for_index
+    except Exception:  # pragma: no cover
+        pass
+
+
 _install_device_id_hook()
 _install_token_rotation_hook()
+_install_stats_persistence()
