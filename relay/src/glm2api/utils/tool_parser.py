@@ -590,6 +590,27 @@ def _find_partial_tag_start(text: str) -> int | None:
     return None
 
 
+# P2-4 标记前置截断（事前防线，对照 chatgpt2api streamable_text）：
+# 抢救层只能救回已知形态的搅碎标记（12.10 三条窄规则），其覆盖之外的变体
+# （如 <DSttool_calls> 字符数都搅错的形态——有意不做无限泛化防误伤）会把
+# 标记逐 delta 泄漏进 content。本防线不试图恢复内容，只保证高置信工具标记
+# 一出现，其后的文本不再作为 content 下发 —— 与抢救层构成纵深：
+# 抢救层管"救得回的"，本防线管"救不回的至少不泄漏"。
+# 检测面刻意收窄到高置信特征：<|DSML| 族与 <dst 前缀搅碎族；正文裸露这些
+# 序列几乎必然是模型生成失控（正常展示应放进代码围栏，围栏内容会被
+# _mask_code_fences 遮蔽、不触发本防线）。
+_TOOL_MARKUP_TELLTALE = re.compile(
+    r"<\|/?dsml|</\|dsml|<\|dsm\b|</?dst[a-z_]*",
+    re.IGNORECASE,
+)
+
+
+def find_tool_markup_start(text: str) -> int | None:
+    """返回首个高置信工具标记的起点；无则 None。"""
+    match = _TOOL_MARKUP_TELLTALE.search(text)
+    return match.start() if match else None
+
+
 def _looks_like_tool_markup_fragment(text: str) -> bool:
     stripped = text.strip()
     lowered = stripped.lower()
@@ -650,7 +671,26 @@ def parse_tool_calls_from_text(text: str, allowed_tool_names: set[str] | None = 
     # _remove_spans 也必须作用在同一份文本上，否则偏移错位导致标记残留。
     text = _repair_corrupted_markup(text)
     spans, tool_calls = _extract_tool_blocks(text, allowed_tool_names, allow_trailing_close=True)
-    return _remove_spans(text, spans), tool_calls
+    visible = _remove_spans(text, spans)
+    return _truncate_pre_tool_markup(visible), tool_calls
+
+
+def _truncate_pre_tool_markup(text: str) -> str:
+    """事前防线（P2-4）：高置信工具标记首次出现处截断，其后不再作为 content。
+
+    命中即 warning 留痕（失败不可伪装成成功）。只对"标记之后"截断，
+    标记之前的正文原样保留。检测在 fence 遮蔽后的文本上做（mask 为逐字符
+    替换、索引不变）—— 代码围栏内的 DSML 字面量是合法展示内容，不触发。
+    """
+    start = find_tool_markup_start(_mask_code_fences(text))
+    if start is None:
+        return text
+    _logger.warning(
+        "标记前置截断防线触发：content 中出现无法恢复的工具标记（位置 %d），其后的 %d 字符不再下发",
+        start,
+        len(text) - start,
+    )
+    return text[:start]
 
 
 @dataclass
@@ -658,11 +698,16 @@ class StreamingToolParser:
     pending_text: str = ""
     tool_calls: list[dict[str, object]] = field(default_factory=list)
     allowed_tool_names: set[str] | None = None
+    # 事前防线锁定：一旦在下发的可见文本里见到高置信工具标记，此后的 delta
+    # 一律不再作为 content 下发（pending 仍继续累积，flush 时抢救层还可尝试）。
+    leaked_lock: bool = False
 
     def consume(self, chunk: str) -> str:
         if not chunk:
             return ""
         self.pending_text += chunk
+        if self.leaked_lock:
+            return ""
         visible, remainder, parsed_calls = _split_stream_text(
             self.pending_text,
             allowed_tool_names=self.allowed_tool_names,
@@ -670,7 +715,10 @@ class StreamingToolParser:
         )
         self.pending_text = remainder
         self.tool_calls.extend(parsed_calls)
-        return visible
+        truncated = _truncate_pre_tool_markup(visible)
+        if len(truncated) != len(visible):
+            self.leaked_lock = True
+        return truncated
 
     def flush(self) -> tuple[str, list[dict[str, object]]]:
         visible, remainder, parsed_calls = _split_stream_text(
@@ -680,5 +728,9 @@ class StreamingToolParser:
         )
         self.pending_text = ""
         self.tool_calls.extend(parsed_calls)
+        if self.leaked_lock:
+            # 已锁定：锁定点之后的 pending 全部是污染区，flush 不再下发任何
+            # 可见文本（抢救出的 tool_calls 照常返回）
+            return "", self.tool_calls
         tail = "" if _looks_like_tool_markup_fragment(remainder) else remainder
         return (visible + tail).strip(), self.tool_calls

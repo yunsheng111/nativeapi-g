@@ -676,6 +676,53 @@ def check_p6(tmp: Path) -> None:
     check(calls == [] and visible == plain, "M7-c 普通正文不被误判", repr(visible))
 
 
+def check_streamguard() -> None:
+    """P2 收尾小批：标记前置截断（事前防线，对照 chatgpt2api streamable_text）。"""
+    from glm2api.utils.tool_parser import StreamingToolParser, parse_tool_calls_from_text
+
+    # 抢救层覆盖之外的搅碎变体（双 t <DSttool_calls>，12.10 有意不做无限泛化）
+    corrupted = '天气预报如下 <DSttool_calls>invoke namer name="get_weather">'
+
+    # SG-a 非流式：无法恢复的搅碎标记及其后内容零下发（截断在标记前，正文保留）
+    visible, calls = parse_tool_calls_from_text(corrupted, {"get_weather"})
+    check(visible == "天气预报如下 ", "SG-a 无法恢复的搅碎标记被前置截断", repr(visible))
+
+    # SG-b 流式逐 delta：标记出现即截断并锁定，后续 delta 一律不再下发
+    parser = StreamingToolParser(allowed_tool_names={"get_weather"})
+    out1 = parser.consume("今天天气不错。")
+    out2 = parser.consume(" <DSttool_calls>垃圾内容")
+    out3 = parser.consume("更多污染文本")
+    check(out1 == "今天天气不错。", "SG-b-a 标记前的正文正常下发", repr(out1))
+    check(out2 == " " and out3 == "", "SG-b-b 标记出现即截断且锁定后续 delta", repr(out2 + "|" + out3))
+    tail, _calls = parser.flush()
+    check(tail == "", "SG-b-c 锁定后 flush 不再下发可见文本", repr(tail))
+
+    # SG-c 代码围栏内的 DSML 字面量是合法展示内容（用户让模型解释协议格式），
+    # 不触发防线 —— 与 _mask_code_fences 的提取遮蔽同一立场
+    fenced = '格式说明：\n```\n<|DSML|tool_calls>示例\n```\n完毕。'
+    visible, calls = parse_tool_calls_from_text(fenced, None)
+    check(calls == [] and visible == fenced, "SG-c 围栏内字面量不误伤", repr(visible))
+
+    # SG-d 完好块回归：事前防线不影响正常工具桥（M7 同型复验）
+    good_block = (
+        '<|DSML|tool_calls>\n  <|DSML|invoke name="get_weather">\n'
+        '    <|DSML|parameter name="city"><![CDATA[上海]]></|DSML|parameter>\n'
+        "  </|DSML|invoke>\n</|DSML|tool_calls>"
+    )
+    visible, calls = parse_tool_calls_from_text("前文 " + good_block + " 后记", {"get_weather"})
+    check(len(calls) == 1 and "前文" in visible and "后记" in visible, "SG-d 完好块路径回归不受影响")
+
+    # SG-e 防线触发留痕（失败不可伪装成成功）
+    logs = LogCapture()
+    parser_logger = logging.getLogger("glm2api.tool_parser")
+    parser_logger.addHandler(logs)
+    try:
+        parse_tool_calls_from_text(corrupted, {"get_weather"})
+    finally:
+        parser_logger.removeHandler(logs)
+    check(any("前置截断" in m for m in logs.messages), "SG-e 防线触发输出可观测日志")
+
+
 # --------------------------------------------------------------- P2.6 P0-1 状态码分类
 
 def check_p01(tmp: Path) -> None:
@@ -1491,6 +1538,7 @@ def main() -> int:
         check_runtime(tmp)
         check_p2(tmp)
         check_p6(tmp)
+        check_streamguard()
         check_identity(tmp)
     finally:
         os.chdir(prev_cwd)
